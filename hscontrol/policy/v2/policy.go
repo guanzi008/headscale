@@ -112,6 +112,8 @@ type PolicyManager struct {
 	nodeAttrsHashes  map[types.NodeID]deephash.Sum
 	nodeAttrsChanged []types.NodeID
 
+	userIPPools map[types.UserID][]netip.Prefix
+
 	// nodesGen counts SetNodes calls that reported a change, so a caller
 	// can tell the policy moved even when another goroutine (the
 	// NodeStore writer) applied the SetNodes.
@@ -294,6 +296,11 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	// rules are derived from these compiled grants.
 	grants := pol.compileGrants(pm.users, pm.nodes)
 
+	userIPPools, err := compileUserIPPools(pol, pm.users, pm.nodes)
+	if err != nil {
+		return false, fmt.Errorf("compiling nodeAttrs ipPool: %w", err)
+	}
+
 	relayTargetIPs, err := collectRelayTargetIPs(grants)
 	if err != nil {
 		return false, fmt.Errorf("collecting relay target IPs: %w", err)
@@ -336,6 +343,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	pm.needsPerNodeFilter = hasPerNodeGrants(pm.compiledGrants)
 	pm.viaTargetTags = collectViaTargetTags(pm.compiledGrants)
 	pm.relayTargetIPs = relayTargetIPs
+	pm.userIPPools = userIPPools
 
 	var filter []tailcfg.FilterRule
 	if pm.pol == nil || (pm.pol.ACLs == nil && pm.pol.Grants == nil) {
@@ -2315,6 +2323,37 @@ func (pm *PolicyManager) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
 	maps.Copy(out, src)
 
 	return out
+}
+
+// IPPoolForUser returns the address pools configured for a user. A nil result
+// means that the user continues to use the tailnet-wide prefixes.
+func (pm *PolicyManager) IPPoolForUser(id types.UserID) []netip.Prefix {
+	if pm == nil {
+		return nil
+	}
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	return slices.Clone(pm.userIPPools[id])
+}
+
+// IPPools returns every user-owned nodeAttrs.ipPool prefix. The outer map
+// and slices are caller-owned.
+func (pm *PolicyManager) IPPools() map[types.UserID][]netip.Prefix {
+	if pm == nil {
+		return nil
+	}
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	pools := make(map[types.UserID][]netip.Prefix, len(pm.userIPPools))
+	for id, prefixes := range pm.userIPPools {
+		pools[id] = slices.Clone(prefixes)
+	}
+
+	return pools
 }
 
 // NodeCapMaps snapshots every node's policy CapMap. The outer map is

@@ -47,6 +47,11 @@ type IPAllocator struct {
 	// database fails, the IP will be allocated here
 	// until the next restart of Headscale.
 	usedIPs netipx.IPSetBuilder
+
+	// reservedPools are nodeAttrs.ipPool ranges owned by users. Global
+	// allocation must never hand out an address inside one, while an
+	// explicit user pool allocation may use its own range.
+	reservedPools netipx.IPSet
 }
 
 // NewIPAllocator returns a new [IPAllocator] singleton which
@@ -138,6 +143,41 @@ func NewIPAllocator(
 }
 
 func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
+	return i.NextForPools(nil, nil)
+}
+
+// SetReservedPools replaces the user address ranges that tailnet-wide
+// allocation must skip. Custom pool allocation uses the requested pool
+// directly, so a node can still receive an address reserved for its owner.
+func (i *IPAllocator) SetReservedPools(prefixes []netip.Prefix) error {
+	var builder netipx.IPSetBuilder
+
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			return fmt.Errorf("invalid reserved IP pool %q", prefix)
+		}
+
+		builder.AddPrefix(prefix.Masked())
+	}
+
+	set, err := builder.IPSet()
+	if err != nil {
+		return fmt.Errorf("building reserved IP pools: %w", err)
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.reservedPools = *set
+
+	return nil
+}
+
+// NextForPools allocates one address of each configured family. A non-empty
+// pool list replaces the tailnet-wide prefix for that family, so a user can
+// never escape their assigned range by exhausting it. Both addresses are
+// reserved under one lock and rolled back together when either family fails.
+func (i *IPAllocator) NextForPools(pools4, pools6 []netip.Prefix) (*netip.Addr, *netip.Addr, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
@@ -148,15 +188,33 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 	)
 
 	prev4 := i.prev4
+	custom4 := len(pools4) > 0
 
-	if i.prefix4 != nil {
+	if custom4 {
+		ret4, err = i.allocateFromPoolsLocked(pools4)
+		if err != nil {
+			return nil, nil, fmt.Errorf("allocating IPv4 address: %w", err)
+		}
+	} else if i.prefix4 != nil {
 		ret4, err = i.allocateNextLocked(&i.prev4, i.prefix4)
 		if err != nil {
 			return nil, nil, fmt.Errorf("allocating IPv4 address: %w", err)
 		}
 	}
 
-	if i.prefix6 != nil {
+	if len(pools6) > 0 {
+		ret6, err = i.allocateFromPoolsLocked(pools6)
+		if err != nil {
+			if ret4 != nil {
+				i.usedIPs.Remove(*ret4)
+				if !custom4 {
+					i.prev4 = prev4
+				}
+			}
+
+			return nil, nil, fmt.Errorf("allocating IPv6 address: %w", err)
+		}
+	} else if i.prefix6 != nil {
 		ret6, err = i.allocateNextLocked(&i.prev6, i.prefix6)
 		if err != nil {
 			// ret4 never reaches a caller, so nothing would ever free it, and
@@ -173,7 +231,77 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 	return ret4, ret6, nil
 }
 
+// NextForPool allocates one address for a single family. It is used when
+// backfilling a node that is missing only one address family.
+func (i *IPAllocator) NextForPool(ipv4 bool, pools []netip.Prefix) (*netip.Addr, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if len(pools) > 0 {
+		return i.allocateFromPoolsLocked(pools)
+	}
+
+	prefix := i.prefix6
+	prev := &i.prev6
+	if ipv4 {
+		prefix = i.prefix4
+		prev = &i.prev4
+	}
+
+	if prefix == nil {
+		return nil, nil
+	}
+
+	return i.allocateNextLocked(prev, prefix)
+}
+
 var ErrCouldNotAllocateIP = errors.New("failed to allocate IP")
+
+func (i *IPAllocator) allocateFromPoolsLocked(prefixes []netip.Prefix) (*netip.Addr, error) {
+	var lastErr error
+
+	for _, prefix := range prefixes {
+		addr, err := i.allocateFromPoolLocked(prefix)
+		if err == nil {
+			return addr, nil
+		}
+
+		lastErr = err
+	}
+
+	if lastErr == nil {
+		lastErr = ErrCouldNotAllocateIP
+	}
+
+	return nil, lastErr
+}
+
+func (i *IPAllocator) allocateFromPoolLocked(prefix netip.Prefix) (*netip.Addr, error) {
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("%w: invalid prefix %q", ErrCouldNotAllocateIP, prefix)
+	}
+
+	rang := netipx.RangeOfPrefix(prefix.Masked())
+	start := rang.From().Next()
+	if !prefix.Contains(start) || start == rang.To() {
+		return nil, ErrCouldNotAllocateIP
+	}
+
+	set, err := i.usedIPs.IPSet()
+	if err != nil {
+		return nil, err
+	}
+
+	for addr := start; prefix.Contains(addr) && addr != rang.To(); addr = addr.Next() {
+		if !set.Contains(addr) && !isTailscaleReservedIP(addr) {
+			i.usedIPs.Add(addr)
+
+			return &addr, nil
+		}
+	}
+
+	return nil, ErrCouldNotAllocateIP
+}
 
 // allocateNext allocates the next address from prefix under i.mu, advancing
 // prev so a run of allocations (e.g. BackfillNodeIPs) does not rescan
@@ -232,7 +360,7 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 
 	start := ip
 	for {
-		if !set.Contains(ip) && !isTailscaleReservedIP(ip) {
+		if !set.Contains(ip) && !i.reservedPools.Contains(ip) && !isTailscaleReservedIP(ip) {
 			i.usedIPs.Add(ip)
 
 			return &ip, nil
@@ -314,6 +442,16 @@ func isTailscaleReservedIP(ip netip.Addr) bool {
 // If a prefix type has been removed (IPv4 or IPv6), it
 // will remove the IPs in that family from the node.
 func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
+	return db.BackfillNodeIPsWithPools(i, nil)
+}
+
+// BackfillNodeIPsWithPools is [HSDatabase.BackfillNodeIPs] with per-user
+// nodeAttrs.ipPool resolution. poolForUser may be nil for the legacy
+// tailnet-wide behavior.
+func (db *HSDatabase) BackfillNodeIPsWithPools(
+	i *IPAllocator,
+	poolForUser func(types.UserID) []netip.Prefix,
+) ([]string, error) {
 	var (
 		err error
 		ret []string
@@ -334,10 +472,23 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 		for _, node := range nodes {
 			log.Trace().Caller().EmbedObject(node).Msg("ip backfill check started because node found in database")
 
+			var pools4, pools6 []netip.Prefix
+			if poolForUser != nil && node.UserID != nil && !node.IsTagged() {
+				for _, pool := range poolForUser(types.UserID(*node.UserID)) {
+					if pool.Addr().Is4() {
+						pools4 = append(pools4, pool)
+					} else {
+						pools6 = append(pools6, pool)
+					}
+				}
+			}
+
+			want4 := i.prefix4 != nil || len(pools4) > 0
+			want6 := i.prefix6 != nil || len(pools6) > 0
 			changed := false
-			// IPv4 prefix is set, but node ip is missing, alloc
-			if i.prefix4 != nil && node.IPv4 == nil {
-				ret4, err := i.allocateNext(&i.prev4, i.prefix4)
+			// IPv4 is configured for this node, but its address is missing.
+			if want4 && node.IPv4 == nil {
+				ret4, err := i.NextForPool(true, pools4)
 				if err != nil {
 					return fmt.Errorf("allocating IPv4 for node(%d): %w", node.ID, err)
 				}
@@ -348,9 +499,9 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 				ret = append(ret, fmt.Sprintf("assigned IPv4 %q to Node(%d) %q", ret4.String(), node.ID, node.Hostname))
 			}
 
-			// IPv6 prefix is set, but node ip is missing, alloc
-			if i.prefix6 != nil && node.IPv6 == nil {
-				ret6, err := i.allocateNext(&i.prev6, i.prefix6)
+			// IPv6 is configured for this node, but its address is missing.
+			if want6 && node.IPv6 == nil {
+				ret6, err := i.NextForPool(false, pools6)
 				if err != nil {
 					return fmt.Errorf("allocating IPv6 for node(%d): %w", node.ID, err)
 				}
@@ -361,15 +512,15 @@ func (db *HSDatabase) BackfillNodeIPs(i *IPAllocator) ([]string, error) {
 				ret = append(ret, fmt.Sprintf("assigned IPv6 %q to Node(%d) %q", ret6.String(), node.ID, node.Hostname))
 			}
 
-			// IPv4 prefix is not set, but node has IP, remove
-			if i.prefix4 == nil && node.IPv4 != nil {
+			// IPv4 is no longer configured for this node, but it has an IP.
+			if !want4 && node.IPv4 != nil {
 				ret = append(ret, fmt.Sprintf("removing IPv4 %q from Node(%d) %q", node.IPv4.String(), node.ID, node.Hostname))
 				node.IPv4 = nil
 				changed = true
 			}
 
-			// IPv6 prefix is not set, but node has IP, remove
-			if i.prefix6 == nil && node.IPv6 != nil {
+			// IPv6 is no longer configured for this node, but it has an IP.
+			if !want6 && node.IPv6 != nil {
 				ret = append(ret, fmt.Sprintf("removing IPv6 %q from Node(%d) %q", node.IPv6.String(), node.ID, node.Hostname))
 				node.IPv6 = nil
 				changed = true

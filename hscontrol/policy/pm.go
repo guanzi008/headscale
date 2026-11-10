@@ -96,6 +96,14 @@ type PolicyManager interface {
 	// Empty selections or no compiled policy capabilities return nil; missing IDs read nil.
 	NodeCapMapsForPeers(peers views.Slice[types.NodeView]) map[types.NodeID]tailcfg.NodeCapMap
 
+	// IPPoolForUser returns the nodeAttrs.ipPool prefixes owned by a user.
+	// A nil result means that new nodes use the tailnet-wide prefixes.
+	IPPoolForUser(id types.UserID) []netip.Prefix
+
+	// IPPools returns every user-owned nodeAttrs.ipPool prefix. The outer
+	// map and slices are caller-owned.
+	IPPools() map[types.UserID][]netip.Prefix
+
 	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
 	// CapMap shifted during recent updateLocked calls. The buffer
 	// drains on read; callers consume it once per update cycle to

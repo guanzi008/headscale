@@ -123,8 +123,8 @@ func parsePrefixes(t *testing.T, name string, s []string) []netip.Prefix {
 // covered by TestNodeAttrsValidate; this list keeps the compat diff focused
 // on shapes both control planes agree on.
 //
-//	IPPOOL_ALLOCATOR — `ipPool` is parsed but the allocator that
-//	    consumes it is not yet implemented.
+//	IPPOOL_USER_ONLY — headscale requires `ipPool` on one exact user
+//	    target so ownership and allocation cannot be ambiguous.
 //	FUNNEL_NOT_SUPPORTED — `funnel` cap is rejected pending the DNS /
 //	    ACME machinery the feature requires.
 //	NO_USER_ROLES — `autogroup:admin` and `autogroup:owner` depend on
@@ -133,9 +133,9 @@ func parsePrefixes(t *testing.T, name string, s []string) []netip.Prefix {
 //	TAILSCALE_DERP_IPS — see derpMapSkipReasons.
 var nodeAttrsSkipReasons = map[string]string{
 	"nodeattrs-derpmap-node-tailscale-ip":  "TAILSCALE_DERP_IPS",
-	"nodeattrs-ippool-g1-admin":            "IPPOOL_ALLOCATOR",
-	"nodeattrs-ippool-g2-group":            "IPPOOL_ALLOCATOR",
-	"nodeattrs-ippool-g3-mixed":            "IPPOOL_ALLOCATOR",
+	"nodeattrs-ippool-g1-admin":            "IPPOOL_USER_ONLY",
+	"nodeattrs-ippool-g2-group":            "IPPOOL_USER_ONLY",
+	"nodeattrs-ippool-g3-mixed":            "IPPOOL_USER_ONLY",
 	"nodeattrs-target-a10-autogroup-admin": "NO_USER_ROLES: autogroup:admin",
 	"nodeattrs-target-a11-autogroup-owner": "NO_USER_ROLES: autogroup:owner",
 	"nodeattrs-attr-c1-funnel":             "FUNNEL_NOT_SUPPORTED",

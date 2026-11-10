@@ -440,6 +440,10 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
+	if err := syncReservedIPPools(ipAlloc, polMan); err != nil {
+		return nil, fmt.Errorf("reserving policy IP pools: %w", err)
+	}
+
 	// Apply defaults for [NodeStore] batch configuration if not set.
 	// This ensures tests that create Config directly (without viper) still work.
 	batchSize := cmp.Or(cfg.Tuning.NodeStoreBatchSize, defaultNodeStoreBatchSize)
@@ -483,9 +487,35 @@ func NewState(cfg *types.Config) (*State, error) {
 	// Surface nodes whose stored data would break map generation (e.g. an
 	// invalid given name from a legacy row) so an operator can fix them. This
 	// only logs; it never mutates a node's stored name at boot.
+	syncIPPoolDNSRoutes(cfg, polMan)
 	s.logNodeHealth()
 
 	return s, nil
+}
+
+// syncReservedIPPools makes tailnet-wide allocation skip every user's
+// nodeAttrs.ipPool. Per-user allocation still passes its pool explicitly and
+// is therefore not blocked by this reservation.
+func syncReservedIPPools(alloc *hsdb.IPAllocator, polMan policy.PolicyManager) error {
+	var prefixes []netip.Prefix
+	for _, pools := range polMan.IPPools() {
+		prefixes = append(prefixes, pools...)
+	}
+
+	return alloc.SetReservedPools(prefixes)
+}
+
+// syncIPPoolDNSRoutes gives MagicDNS reverse zones to pools outside Tailscale's
+// built-in CGNAT and ULA ranges. Without this, a node using an address such as
+// 10.42.0.1 cannot resolve its own MagicDNS reverse name even though the
+// forward name and exact host route work.
+func syncIPPoolDNSRoutes(cfg *types.Config, polMan policy.PolicyManager) bool {
+	var prefixes []netip.Prefix
+	for _, pools := range polMan.IPPools() {
+		prefixes = append(prefixes, pools...)
+	}
+
+	return cfg.SetIPPoolDNSRoutes(prefixes)
 }
 
 // policyPeersFunc is the [PeersFunc] [State] runs its [NodeStore] with.
@@ -574,7 +604,7 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	s.policyMu.Lock()
 	defer s.policyMu.Unlock()
 
-	_, derpChanged, err := s.reloadPolicyLocked()
+	policyChanged, derpChanged, err := s.reloadPolicyLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -582,6 +612,10 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	// Nodes whose CapMap shifted get their self refresh from
 	// [State.DrainSelfRefreshes] when these changes are dispatched.
 	changes := []change.Change{change.PolicyChange()}
+	if policyChanged {
+		changes = append(changes, change.DNSConfig())
+	}
+
 	if derpChanged {
 		changes = append(changes, change.DERPMap())
 	}
@@ -606,6 +640,12 @@ func (s *State) reloadPolicyLocked() (bool, bool, error) {
 			return false, false, fmt.Errorf("setting policy: %w", err)
 		}
 	}
+
+	if err := syncReservedIPPools(s.ipAlloc, s.polMan); err != nil {
+		return false, false, fmt.Errorf("reserving policy IP pools: %w", err)
+	}
+
+	syncIPPoolDNSRoutes(s.cfg, s.polMan)
 
 	// Checked even when the policy is unchanged: [State.SetPolicy] may have
 	// installed it already.
@@ -1625,7 +1665,7 @@ func (s *State) BackfillNodeIPs() ([]string, []change.Change, error) {
 	// persist writes the old ones back from NodeStore in between.
 	s.persistMu.Lock()
 
-	changes, err := s.db.BackfillNodeIPs(s.ipAlloc)
+	changes, err := s.db.BackfillNodeIPsWithPools(s.ipAlloc, s.polMan.IPPoolForUser)
 	if err != nil {
 		s.persistMu.Unlock()
 
@@ -1795,6 +1835,12 @@ func (s *State) SetPolicy(pol []byte) (bool, error) {
 		return changed, err
 	}
 
+	if err := syncReservedIPPools(s.ipAlloc, s.polMan); err != nil {
+		return changed, fmt.Errorf("reserving policy IP pools: %w", err)
+	}
+
+	syncIPPoolDNSRoutes(s.cfg, s.polMan)
+
 	// Payload-only writes reuse the cached adjacency, so a policy swap
 	// must rebuild it here rather than wait for the next relation write.
 	if changed {
@@ -1953,6 +1999,7 @@ func (s *State) UpdatePolicy(pol []byte) (*types.Policy, []change.Change, error)
 	// As on SaaS, a write that changes nothing sends clients nothing.
 	if changed {
 		changes = append(changes, change.PolicyChange())
+		changes = append(changes, change.DNSConfig())
 	}
 
 	if derpChanged {
@@ -2871,8 +2918,24 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		return types.NodeView{}, err
 	}
 
-	// Allocate new IPs
-	ipv4, ipv6, err := s.ipAlloc.Next()
+	// Allocate new IPs. A user-specific nodeAttrs.ipPool replaces the
+	// tailnet-wide prefix for each family it contains; an omitted family
+	// keeps using the global allocation strategy.
+	var (
+		pools4 []netip.Prefix
+		pools6 []netip.Prefix
+	)
+	if nodeToRegister.UserID != nil && !nodeToRegister.IsTagged() {
+		for _, pool := range s.polMan.IPPoolForUser(types.UserID(*nodeToRegister.UserID)) {
+			if pool.Addr().Is4() {
+				pools4 = append(pools4, pool)
+			} else {
+				pools6 = append(pools6, pool)
+			}
+		}
+	}
+
+	ipv4, ipv6, err := s.ipAlloc.NextForPools(pools4, pools6)
 	if err != nil {
 		return types.NodeView{}, fmt.Errorf("allocating IPs: %w", err)
 	}
@@ -4085,6 +4148,11 @@ func (s *State) updatePolicyManagerUsers() (change.Change, error) {
 		return change.Change{}, fmt.Errorf("updating policy manager users: %w", err)
 	}
 
+	if err := syncReservedIPPools(s.ipAlloc, s.polMan); err != nil {
+		return change.Change{}, fmt.Errorf("reserving policy IP pools after user update: %w", err)
+	}
+	dnsChanged := syncIPPoolDNSRoutes(s.cfg, s.polMan)
+
 	log.Debug().Caller().Bool("policy.changed", changed).Msg("policy manager user update completed because SetUsers operation finished")
 
 	if peerMapChanged {
@@ -4094,11 +4162,15 @@ func (s *State) updatePolicyManagerUsers() (change.Change, error) {
 		s.nodeStore.RebuildPeerMaps()
 	}
 
+	var c change.Change
 	if changed {
-		return change.PolicyChange(), nil
+		c = c.Merge(change.PolicyChange())
+	}
+	if dnsChanged {
+		c = c.Merge(change.DNSConfig())
 	}
 
-	return change.Change{}, nil
+	return c, nil
 }
 
 // UpdatePolicyManagerUsersForTest updates the policy manager's user cache.
@@ -4156,6 +4228,10 @@ func (s *State) updatePolicyManagerNodes(genBefore uint64) (change.Change, error
 	changed, err := s.polMan.SetNodes(nodes)
 	if err != nil {
 		return s.policyChangeSince(genBefore), fmt.Errorf("updating policy manager nodes: %w", err)
+	}
+
+	if err := syncReservedIPPools(s.ipAlloc, s.polMan); err != nil {
+		return s.policyChangeSince(genBefore), fmt.Errorf("reserving policy IP pools after node update: %w", err)
 	}
 
 	if changed {

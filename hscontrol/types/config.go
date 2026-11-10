@@ -151,6 +151,10 @@ type Config struct {
 	// it can be used directly when sending Netmaps to clients.
 	TailcfgDNSConfig *tailcfg.DNSConfig
 
+	// ipPoolDNSRoutes tracks reverse-DNS routes added for user address pools,
+	// so removing a pool can remove only the routes this process owns.
+	ipPoolDNSRoutes map[string]struct{}
+
 	DNSChallenge DNSChallengeConfig
 
 	UnixSocket           string
@@ -2125,6 +2129,90 @@ func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
 	if c.TailcfgDNSConfig != nil {
 		c.TailcfgDNSConfig.ExtraRecords = lowercaseRecordNames(records)
 	}
+}
+
+// SetIPPoolDNSRoutes updates the reverse-DNS routes needed for user address
+// pools outside Tailscale's built-in CGNAT and ULA ranges. It returns whether
+// the routes changed. Routes already configured as split DNS are left alone
+// and are not considered owned by the address-pool manager.
+func (c *Config) SetIPPoolDNSRoutes(prefixes []netip.Prefix) bool {
+	wanted := make(map[string]struct{})
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			continue
+		}
+
+		prefix = prefix.Masked()
+		if prefix.Addr().Is4() {
+			if prefix.Bits() >= tsaddr.CGNATRange().Bits() && tsaddr.CGNATRange().Contains(prefix.Addr()) {
+				continue
+			}
+
+			for _, domain := range util.GenerateIPv4DNSRootDomain(prefix) {
+				wanted[domain.WithoutTrailingDot()] = struct{}{}
+			}
+		} else if prefix.Addr().Is6() {
+			if prefix.Bits() >= tsaddr.TailscaleULARange().Bits() && tsaddr.TailscaleULARange().Contains(prefix.Addr()) {
+				continue
+			}
+
+			for _, domain := range util.GenerateIPv6DNSRootDomain(prefix) {
+				wanted[domain.WithoutTrailingDot()] = struct{}{}
+			}
+		}
+	}
+
+	tailcfgDNSMu.Lock()
+	defer tailcfgDNSMu.Unlock()
+
+	if c.TailcfgDNSConfig == nil || !c.TailcfgDNSConfig.Proxied {
+		return false
+	}
+
+	changed := false
+	routes := c.TailcfgDNSConfig.Routes
+	if len(wanted) > 0 && routes == nil {
+		routes = make(map[string][]*dnstype.Resolver)
+		c.TailcfgDNSConfig.Routes = routes
+	}
+
+	for name := range c.ipPoolDNSRoutes {
+		if _, keep := wanted[name]; keep {
+			continue
+		}
+
+		if resolvers, ok := routes[name]; ok && len(resolvers) == 0 {
+			delete(routes, name)
+			changed = true
+		}
+
+		delete(c.ipPoolDNSRoutes, name)
+	}
+
+	for name := range wanted {
+		if _, managed := c.ipPoolDNSRoutes[name]; managed {
+			if _, ok := routes[name]; !ok {
+				routes[name] = []*dnstype.Resolver{}
+				changed = true
+			}
+
+			continue
+		}
+
+		if _, exists := routes[name]; exists {
+			continue
+		}
+
+		routes[name] = []*dnstype.Resolver{}
+		if c.ipPoolDNSRoutes == nil {
+			c.ipPoolDNSRoutes = make(map[string]struct{})
+		}
+
+		c.ipPoolDNSRoutes[name] = struct{}{}
+		changed = true
+	}
+
+	return changed
 }
 
 // lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names

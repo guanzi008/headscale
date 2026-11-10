@@ -254,13 +254,13 @@ func TestNodeAttrsValidate(t *testing.T) {
 			wantErr: ErrNodeAttrUnsupported,
 		},
 		{
-			name:    "ipPool set rejected as unsupported",
+			name:    "ipPool target must be one exact user",
 			extra:   `"nodeAttrs": [{"target": ["autogroup:member"], "ipPool": ["100.81.0.0/16"]}]`,
-			wantErr: ErrNodeAttrIPPoolUnsupported,
+			wantErr: ErrNodeAttrsIPPoolTarget,
 		},
 		{
 			name:    "ipPool overlapping reserved range rejected at validate",
-			extra:   `"nodeAttrs": [{"target": ["autogroup:member"], "ipPool": ["100.100.100.0/24"]}]`,
+			extra:   `"nodeAttrs": [{"target": ["alice@example.com"], "ipPool": ["100.100.100.0/24"]}]`,
 			wantErr: ErrNodeAttrsIPPoolReserved,
 		},
 	}
@@ -293,11 +293,21 @@ func TestNodeAttrsIPPoolValidator(t *testing.T) {
 		wantErr error
 	}{
 		{name: "in cgnat", prefix: "100.81.0.0/16"},
-		{name: "outside cgnat", prefix: "10.0.0.0/8", wantErr: ErrNodeAttrsIPPoolOutOfRange},
+		{name: "private class a", prefix: "10.0.0.0/8"},
+		{name: "private class b", prefix: "172.16.0.0/12"},
+		{name: "private class c", prefix: "192.168.0.0/16"},
+		{name: "ipv6 ula", prefix: "fd42:1234::/64"},
 		{name: "less specific than cgnat", prefix: "100.0.0.0/8", wantErr: ErrNodeAttrsIPPoolOutOfRange},
+		{name: "public ipv4", prefix: "8.8.8.0/24", wantErr: ErrNodeAttrsIPPoolOutOfRange},
+		{name: "less specific than ula", prefix: "fc00::/6", wantErr: ErrNodeAttrsIPPoolOutOfRange},
+		{name: "link local ipv6", prefix: "fe80::/64", wantErr: ErrNodeAttrsIPPoolOutOfRange},
 		{name: "whole cgnat overlaps reserved", prefix: "100.64.0.0/10", wantErr: ErrNodeAttrsIPPoolReserved},
 		{name: "overlaps quad100", prefix: "100.100.100.0/24", wantErr: ErrNodeAttrsIPPoolReserved},
 		{name: "overlaps ipn", prefix: "100.115.92.0/24", wantErr: ErrNodeAttrsIPPoolReserved},
+		{name: "ipv4 slash 31 cannot allocate", prefix: "10.20.30.0/31", wantErr: ErrNodeAttrsIPPoolTooSmall},
+		{name: "ipv4 single host cannot allocate", prefix: "10.20.30.1/32", wantErr: ErrNodeAttrsIPPoolTooSmall},
+		{name: "ipv6 slash 127 cannot allocate", prefix: "fd42:1234::/127", wantErr: ErrNodeAttrsIPPoolTooSmall},
+		{name: "ipv6 single host cannot allocate", prefix: "fd42:1234::1/128", wantErr: ErrNodeAttrsIPPoolTooSmall},
 	}
 
 	for _, tt := range tests {
@@ -315,6 +325,191 @@ func TestNodeAttrsIPPoolValidator(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestNodeAttrsIPPoolUserValidation(t *testing.T) {
+	t.Parallel()
+
+	baseUsers := append(nodeAttrsTestUsers(), types.User{ID: 3, Name: "carol", Email: "carol@example.net"})
+	baseNodes := nodeAttrsTestNodes(baseUsers)
+
+	tests := []struct {
+		name    string
+		policy  string
+		wantErr error
+	}{
+		{
+			name:   "exact user pool accepted",
+			policy: `{"nodeAttrs":[{"target":["carol@example.net"],"ipPool":["10.20.30.0/24","fd42:1234::/64"]}]}`,
+		},
+		{
+			name:    "wildcard target rejected",
+			policy:  `{"nodeAttrs":[{"target":["user:*@example.net"],"ipPool":["10.20.30.0/24"]}]}`,
+			wantErr: ErrNodeAttrsIPPoolTarget,
+		},
+		{
+			name: "duplicate user rejected",
+			policy: `{"nodeAttrs":[
+				{"target":["carol@example.net"],"ipPool":["10.20.30.0/24"]},
+				{"target":["carol@example.net"],"ipPool":["10.20.31.0/24"]}
+			]}`,
+			wantErr: ErrNodeAttrsIPPoolDuplicate,
+		},
+		{
+			name: "overlapping users rejected",
+			policy: `{"nodeAttrs":[
+				{"target":["carol@example.net"],"ipPool":["10.20.0.0/16"]},
+				{"target":["alice@example.com"],"ipPool":["10.20.30.0/24"]}
+			]}`,
+			wantErr: ErrNodeAttrsIPPoolOverlap,
+		},
+		{
+			name:    "existing owned address outside pool rejected",
+			policy:  `{"nodeAttrs":[{"target":["alice@example.com"],"ipPool":["10.20.30.0/24"]}]}`,
+			wantErr: ErrNodeAttrsIPPoolNodeConflict,
+		},
+		{
+			name:    "other user's node inside pool rejected",
+			policy:  `{"nodeAttrs":[{"target":["carol@example.net"],"ipPool":["100.64.0.0/24"]}]}`,
+			wantErr: ErrNodeAttrsIPPoolNodeConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pm, err := NewPolicyManager([]byte(tt.policy), baseUsers, baseNodes.ViewSlice())
+			if tt.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			if tt.name == "exact user pool accepted" {
+				assert.Equal(t, []netip.Prefix{
+					netip.MustParsePrefix("10.20.30.0/24"),
+					netip.MustParsePrefix("fd42:1234::/64"),
+				}, pm.IPPoolForUser(3))
+				for _, node := range baseNodes {
+					assert.Contains(t, pm.NodeCapMap(node.ID), nodecap.OneCGNATDisable)
+				}
+			}
+		})
+	}
+}
+
+func TestNodeAttrsIPPoolExistingAddressesInUsablePool(t *testing.T) {
+	t.Parallel()
+
+	users := nodeAttrsTestUsers()
+	nodes := types.Nodes{{
+		ID:        1,
+		GivenName: "alice-custom",
+		User:      &users[0],
+		UserID:    &users[0].ID,
+		IPv4:      ptrAddr("10.20.30.1"),
+		IPv6:      ptrAddr("fd42:1234::1"),
+		Hostinfo:  &tailcfg.Hostinfo{},
+	}}
+
+	pm, err := NewPolicyManager([]byte(`{"nodeAttrs":[{"target":["alice@example.com"],"ipPool":["10.20.30.0/30","fd42:1234::/126"]}]}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+	assert.Equal(t, []netip.Prefix{
+		netip.MustParsePrefix("10.20.30.0/30"),
+		netip.MustParsePrefix("fd42:1234::/126"),
+	}, pm.IPPoolForUser(types.UserID(users[0].ID)))
+	assert.Contains(t, pm.NodeCapMap(nodes[0].ID), nodecap.OneCGNATDisable)
+}
+
+func TestNodeAttrsIPv6OnlyPoolKeepsAutomaticCGNATRouting(t *testing.T) {
+	t.Parallel()
+
+	users := nodeAttrsTestUsers()
+	nodes := types.Nodes{{
+		ID:        1,
+		GivenName: "alice-custom-v6",
+		User:      &users[0],
+		UserID:    &users[0].ID,
+		IPv6:      ptrAddr("fd42:1234::1"),
+		Hostinfo:  &tailcfg.Hostinfo{},
+	}}
+
+	pm, err := NewPolicyManager([]byte(`{"nodeAttrs":[{"target":["alice@example.com"],"ipPool":["fd42:1234::/126"]}]}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+	assert.NotContains(t, pm.NodeCapMap(nodes[0].ID), nodecap.OneCGNATDisable)
+}
+
+func TestWildcardACLIncludesCustomPoolNodeAddresses(t *testing.T) {
+	t.Parallel()
+
+	users := nodeAttrsTestUsers()
+	nodes := types.Nodes{
+		{
+			ID:        1,
+			GivenName: "alice-custom",
+			User:      &users[0],
+			UserID:    &users[0].ID,
+			IPv4:      ptrAddr("10.42.0.1"),
+			Hostinfo:  &tailcfg.Hostinfo{},
+		},
+		{
+			ID:        2,
+			GivenName: "bob-custom",
+			User:      &users[1],
+			UserID:    &users[1].ID,
+			IPv4:      ptrAddr("10.43.0.1"),
+			Hostinfo:  &tailcfg.Hostinfo{},
+		},
+	}
+
+	pm, err := NewPolicyManager([]byte(`{
+		"nodeAttrs": [
+			{"target": ["alice@example.com"], "ipPool": ["10.42.0.0/24"]},
+			{"target": ["bob@example.org"], "ipPool": ["10.43.0.0/24"]}
+		],
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
+	}`), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	matchers, err := pm.MatchersForNode(nodes[0].View())
+	require.NoError(t, err)
+	assert.True(t, nodes[0].View().CanAccess(matchers, nodes[1].View()))
+}
+
+func TestWildcardACLDoesNotExpandUnpooledNonstandardAddresses(t *testing.T) {
+	t.Parallel()
+
+	users := nodeAttrsTestUsers()
+	nodes := types.Nodes{
+		{
+			ID:        1,
+			GivenName: "alice-custom",
+			User:      &users[0],
+			UserID:    &users[0].ID,
+			IPv4:      ptrAddr("10.42.0.1"),
+			Hostinfo:  &tailcfg.Hostinfo{},
+		},
+		{
+			ID:        2,
+			GivenName: "legacy",
+			User:      &users[1],
+			UserID:    &users[1].ID,
+			IPv4:      ptrAddr("200.200.200.200"),
+			Hostinfo:  &tailcfg.Hostinfo{},
+		},
+	}
+	policy := &Policy{NodeAttrs: []NodeAttrGrant{{
+		Targets: Aliases{up("alice@example.com")},
+		IPPool:  []netip.Prefix{netip.MustParsePrefix("10.42.0.0/24")},
+	}}}
+
+	resolved, err := Asterix(0).Resolve(policy, users, nodes.ViewSlice())
+	require.NoError(t, err)
+	assert.True(t, resolved.Contains(netip.MustParseAddr("10.42.0.1")))
+	assert.False(t, resolved.Contains(netip.MustParseAddr("200.200.200.200")))
 }
 
 func TestNodesWithChangedCapMap(t *testing.T) {

@@ -92,6 +92,17 @@ the Tailscale admin console. `GET /api/v2/device/{id}/update-status` reports the
 update. Both answer as Tailscale does: a node that does not allow remote updates,
 is not connected, or refuses is "not found". See [the client docs](https://headscale.net/stable/about/clients/#update-clients). [#3632](https://github.com/juanfont/headscale/pull/3632)
 
+### Per-user address pools
+
+Headscale policy files can now assign private IPv4 ranges or IPv6 ULA ranges to
+an individual user with `nodeAttrs.ipPool`. Untagged devices owned by that user
+allocate from their pool, while global allocation reserves every configured
+pool. Pools are validated against other pools, existing node addresses,
+Tailscale's MagicDNS and Quad100 ranges, and the policy's private-range rules.
+When a custom pool exists, clients use exact `/32` host routes instead of the
+special CGNAT route, and Headscale adds the reverse-DNS routes needed for
+MagicDNS. See [the policy reference](https://headscale.net/stable/ref/policy/#per-user-address-pools).
+
 ### BREAKING
 
 #### Database

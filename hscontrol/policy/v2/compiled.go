@@ -173,6 +173,87 @@ func nodeHasUserIdentity(node types.NodeView) bool {
 	return !node.IsTagged() && node.User().Valid()
 }
 
+func prefixListContains(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func prefixListHasFamily(prefixes []netip.Prefix, ipv4 bool) bool {
+	for _, prefix := range prefixes {
+		if prefix.Addr().Is4() == ipv4 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// compileUserIPPools resolves nodeAttrs.ipPool entries to their owning users
+// and verifies that existing addresses can keep their current assignment.
+func compileUserIPPools(
+	pol *Policy,
+	users types.Users,
+	nodes views.Slice[types.NodeView],
+) (map[types.UserID][]netip.Prefix, error) {
+	pools := make(map[types.UserID][]netip.Prefix)
+	if pol == nil {
+		return pools, nil
+	}
+
+	for _, na := range pol.NodeAttrs {
+		if len(na.IPPool) == 0 {
+			continue
+		}
+		if len(na.Targets) != 1 {
+			return nil, fmt.Errorf("%w: got %d targets", ErrNodeAttrsIPPoolTarget, len(na.Targets))
+		}
+		username, ok := na.Targets[0].(*Username)
+		if !ok || strings.HasPrefix(string(*username), "user:*@") {
+			return nil, fmt.Errorf("%w: got %q", ErrNodeAttrsIPPoolTarget, na.Targets[0])
+		}
+		user, err := username.resolveUser(users)
+		if err != nil {
+			return nil, fmt.Errorf("resolving nodeAttrs ipPool target %q: %w", username, err)
+		}
+		userID := types.UserID(user.ID)
+		if _, exists := pools[userID]; exists {
+			return nil, fmt.Errorf("%w: %q", ErrNodeAttrsIPPoolDuplicate, username)
+		}
+		prefixes := slices.Clone(na.IPPool)
+		slices.SortFunc(prefixes, netip.Prefix.Compare)
+		pools[userID] = prefixes
+	}
+
+	for userID, prefixes := range pools {
+		for _, node := range nodes.All() {
+			owner := node.TypedUserID()
+			for _, addr := range node.IPs() {
+				contained := prefixListContains(prefixes, addr)
+				if !node.IsTagged() && owner == userID {
+					if prefixListHasFamily(prefixes, addr.Is4()) && !contained {
+						return nil, fmt.Errorf("%w: node %d (%s) has %s outside the pool for user %d",
+							ErrNodeAttrsIPPoolNodeConflict, node.ID(), node.GivenName(), addr, userID)
+					}
+
+					continue
+				}
+
+				if contained {
+					return nil, fmt.Errorf("%w: pool for user %d contains node %d (%s) address %s",
+						ErrNodeAttrsIPPoolNodeConflict, userID, node.ID(), node.GivenName(), addr)
+				}
+			}
+		}
+	}
+
+	return pools, nil
+}
+
 // compileNodeAttrs returns the per-node CapMap derived from policy
 // nodeAttrs plus the tailnet-wide [Policy.RandomizeClientPort] flag.
 //
@@ -228,6 +309,17 @@ func (pol *Policy) compileNodeAttrs(
 	if pol.RandomizeClientPort {
 		for _, ni := range nodeList {
 			stamp(ni.id, nodecap.RandomizeClientPort)
+		}
+	}
+
+	hasCustomIPv4Pool := slices.ContainsFunc(pol.NodeAttrs, func(na NodeAttrGrant) bool {
+		return slices.ContainsFunc(na.IPPool, func(prefix netip.Prefix) bool {
+			return prefix.Addr().Is4()
+		})
+	})
+	if hasCustomIPv4Pool {
+		for _, ni := range nodeList {
+			stamp(ni.id, nodecap.OneCGNATDisable)
 		}
 	}
 

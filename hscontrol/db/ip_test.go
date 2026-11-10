@@ -619,3 +619,130 @@ func TestIPAllocatorNextReleasesIPv4WhenIPv6Fails(t *testing.T) {
 		})
 	}
 }
+
+func TestIPAllocatorNextForPools(t *testing.T) {
+	t.Run("custom v4 and v6", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, nil, nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		pools4 := []netip.Prefix{netip.MustParsePrefix("10.20.30.0/30")}
+		pools6 := []netip.Prefix{netip.MustParsePrefix("fd42:1234::/126")}
+
+		got4, got6, err := alloc.NextForPools(pools4, pools6)
+		require.NoError(t, err)
+		assert.Equal(t, na("10.20.30.1"), *got4)
+		assert.Equal(t, na("fd42:1234::1"), *got6)
+
+		got4, got6, err = alloc.NextForPools(pools4, pools6)
+		require.NoError(t, err)
+		assert.Equal(t, na("10.20.30.2"), *got4)
+		assert.Equal(t, na("fd42:1234::2"), *got6)
+
+		_, _, err = alloc.NextForPools(pools4, pools6)
+		require.ErrorIs(t, err, ErrCouldNotAllocateIP)
+	})
+
+	t.Run("custom v4 with global v6 fallback", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/30"), mpp("fd7a:115c:a1e0::/126"), types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		got4, got6, err := alloc.NextForPools([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/30")}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, na("10.0.0.1"), *got4)
+		assert.Equal(t, na("fd7a:115c:a1e0::1"), *got6)
+	})
+
+	t.Run("rollback when v6 pool is exhausted", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, nil, nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		pools4 := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/30")}
+		_, _, err = alloc.NextForPools(pools4, []netip.Prefix{netip.MustParsePrefix("fd42::/127")})
+		require.ErrorIs(t, err, ErrCouldNotAllocateIP)
+
+		got4, _, err := alloc.NextForPools(pools4, nil)
+		require.NoError(t, err)
+		assert.Equal(t, na("10.0.0.1"), *got4)
+	})
+
+	t.Run("pools share the global used set", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/29"), nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		global, _, err := alloc.Next()
+		require.NoError(t, err)
+		assert.Equal(t, na("100.64.0.1"), *global)
+
+		custom, _, err := alloc.NextForPools([]netip.Prefix{netip.MustParsePrefix("100.64.0.0/29")}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, na("100.64.0.2"), *custom)
+	})
+
+	t.Run("reserved addresses are skipped", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, nil, nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		pools := []netip.Prefix{netip.MustParsePrefix("100.100.100.96/27")}
+		for _, want := range []string{"100.100.100.97", "100.100.100.98", "100.100.100.99", "100.100.100.101"} {
+			got, _, err := alloc.NextForPools(pools, nil)
+			require.NoError(t, err)
+			assert.Equal(t, na(want), *got)
+		}
+	})
+}
+
+func TestIPAllocatorReservedPools(t *testing.T) {
+	t.Run("global allocation skips user pools", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/29"), nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+		require.NoError(t, alloc.SetReservedPools([]netip.Prefix{netip.MustParsePrefix("100.64.0.2/31")}))
+
+		for _, want := range []string{"100.64.0.1", "100.64.0.4", "100.64.0.5", "100.64.0.6"} {
+			got, _, err := alloc.Next()
+			require.NoError(t, err)
+			assert.Equal(t, na(want), *got)
+		}
+	})
+
+	t.Run("random allocation skips user pools", func(t *testing.T) {
+		const iterations = 1000
+
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/16"), nil, types.IPAllocationStrategyRandom)
+		require.NoError(t, err)
+
+		reserved := netip.MustParsePrefix("100.64.0.2/31")
+		require.NoError(t, alloc.SetReservedPools([]netip.Prefix{reserved}))
+
+		for range iterations {
+			got, _, err := alloc.Next()
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.False(t, reserved.Contains(*got), "allocator returned reserved address %s", got)
+		}
+	})
+
+	t.Run("custom allocation may use its own reserved range", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/29"), nil, types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		pool := []netip.Prefix{netip.MustParsePrefix("100.64.0.0/30")}
+		require.NoError(t, alloc.SetReservedPools(pool))
+
+		got, _, err := alloc.NextForPools(pool, nil)
+		require.NoError(t, err)
+		assert.Equal(t, na("100.64.0.1"), *got)
+	})
+
+	t.Run("one family supports backfill", func(t *testing.T) {
+		alloc, err := NewIPAllocator(nil, mpp("100.64.0.0/30"), mpp("fd42::/64"), types.IPAllocationStrategySequential)
+		require.NoError(t, err)
+
+		got, err := alloc.NextForPool(true, nil)
+		require.NoError(t, err)
+		assert.Equal(t, na("100.64.0.1"), *got)
+
+		got, err = alloc.NextForPool(false, []netip.Prefix{netip.MustParsePrefix("fd42:1234::/126")})
+		require.NoError(t, err)
+		assert.Equal(t, na("fd42:1234::1"), *got)
+	})
+}

@@ -1119,6 +1119,43 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 	}
 }
 
+func TestSetIPPoolDNSRoutes(t *testing.T) {
+	operatorRoute := "16.172.in-addr.arpa."
+	cfg := &Config{TailcfgDNSConfig: &tailcfg.DNSConfig{
+		Proxied: true,
+		Routes: map[string][]*dnstype.Resolver{
+			operatorRoute: {{Addr: "1.1.1.1"}},
+		},
+	}}
+
+	changed := cfg.SetIPPoolDNSRoutes([]netip.Prefix{
+		netip.MustParsePrefix("10.42.0.0/16"),
+		netip.MustParsePrefix("172.16.0.0/16"),
+		netip.MustParsePrefix("fd42:1234::/64"),
+	})
+	require.True(t, changed)
+	assert.Empty(t, cfg.TailcfgDNSConfig.Routes["42.10.in-addr.arpa."])
+	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, cfg.TailcfgDNSConfig.Routes[operatorRoute])
+
+	var ipv6Route string
+	for route := range cfg.TailcfgDNSConfig.Routes {
+		if strings.HasSuffix(route, ".ip6.arpa") {
+			ipv6Route = route
+		}
+	}
+	require.NotEmpty(t, ipv6Route)
+
+	changed = cfg.SetIPPoolDNSRoutes([]netip.Prefix{netip.MustParsePrefix("10.42.0.0/16")})
+	require.True(t, changed)
+	assert.NotContains(t, cfg.TailcfgDNSConfig.Routes, ipv6Route)
+	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, cfg.TailcfgDNSConfig.Routes[operatorRoute])
+
+	assert.False(t, cfg.SetIPPoolDNSRoutes([]netip.Prefix{netip.MustParsePrefix("10.42.0.0/16")}))
+	require.True(t, cfg.SetIPPoolDNSRoutes(nil))
+	assert.NotContains(t, cfg.TailcfgDNSConfig.Routes, "42.10.in-addr.arpa.")
+	assert.Equal(t, []*dnstype.Resolver{{Addr: "1.1.1.1"}}, cfg.TailcfgDNSConfig.Routes[operatorRoute])
+}
+
 func TestDNSChallengeConfig(t *testing.T) {
 	secret := filepath.Join(t.TempDir(), "token")
 	require.NoError(t, os.WriteFile(secret, []byte("file-token\n"), 0o600))

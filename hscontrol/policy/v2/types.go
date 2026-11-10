@@ -109,10 +109,14 @@ var (
 // NodeAttrs validation errors.
 var (
 	ErrNodeAttrsIPPoolReserved      = errors.New("nodeAttrs ipPool must not overlap reserved Tailscale ranges")
-	ErrNodeAttrsIPPoolOutOfRange    = errors.New("nodeAttrs ipPool must be within 100.64.0.0/10")
+	ErrNodeAttrsIPPoolOutOfRange    = errors.New("nodeAttrs ipPool must be a private IPv4 range or an IPv6 ULA range")
+	ErrNodeAttrsIPPoolTooSmall      = errors.New("nodeAttrs ipPool is too small to allocate node addresses")
+	ErrNodeAttrsIPPoolTarget        = errors.New("nodeAttrs ipPool requires exactly one exact user target")
+	ErrNodeAttrsIPPoolDuplicate     = errors.New("nodeAttrs ipPool is defined more than once for a user")
+	ErrNodeAttrsIPPoolOverlap       = errors.New("nodeAttrs ipPool ranges must not overlap")
+	ErrNodeAttrsIPPoolNodeConflict  = errors.New("nodeAttrs ipPool conflicts with an existing node address")
 	ErrNodeAttrsAutogroupNotAllowed = errors.New("nodeAttrs target does not support this autogroup")
 	ErrNodeAttrUnsupported          = errors.New("nodeAttrs uses a feature headscale does not yet support")
-	ErrNodeAttrIPPoolUnsupported    = errors.New("nodeAttrs ipPool requires the IP allocator (https://github.com/juanfont/headscale/issues/2912)")
 	ErrNodeAttrTargetUnsupported    = errors.New("nodeAttrs target alias type is not supported")
 )
 
@@ -391,8 +395,42 @@ func (a Asterix) Resolve(p *Policy, u types.Users, n views.Slice[types.NodeView]
 	return newResolvedAddresses(a.resolve(p, u, n))
 }
 
-func (a Asterix) resolve(_ *Policy, _ types.Users, _ views.Slice[types.NodeView]) (*netipx.IPSet, error) {
-	return asterixResolved(), nil
+func nodeAddressInPolicyIPPool(p *Policy, node types.NodeView) bool {
+	if p == nil {
+		return false
+	}
+
+	for _, attrs := range p.NodeAttrs {
+		for _, prefix := range attrs.IPPool {
+			if slices.ContainsFunc(node.IPs(), prefix.Contains) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (a Asterix) resolve(p *Policy, _ types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
+	var builder netipx.IPSetBuilder
+	builder.AddSet(asterixResolved())
+
+	// A nodeAttrs ipPool can put a node outside the CGNAT and Tailscale ULA
+	// ranges. Wildcards still mean "every node", so include the addresses the
+	// current nodes actually hold in an explicit pool rather than expanding to
+	// unrelated addresses from older or manually edited node records.
+	for _, node := range nodes.All() {
+		if nodeAddressInPolicyIPPool(p, node) {
+			node.AppendToIPSet(&builder)
+		}
+	}
+
+	ips, err := builder.IPSet()
+	if err != nil {
+		return nil, fmt.Errorf("building wildcard IPSet: %w", err)
+	}
+
+	return ips, nil
 }
 
 // approvedSubnetRoutes collects all approved non-exit subnet routes across all
@@ -2007,8 +2045,9 @@ func (g Grant) appPart() (Grant, bool) {
 // resolved exactly like ACL/grant sources, so users, groups, tags, hosts,
 // prefixes, autogroup:member, autogroup:tagged, and "*" are all valid.
 //
-// IPPool is parsed and validated for forward compatibility with the IP
-// allocator; the policy compiler does not consume it yet.
+// IPPool assigns one exact user's untagged nodes to private address ranges.
+// The policy compiler resolves it into per-user allocation and reserves every
+// such range from tailnet-wide allocation.
 type NodeAttrGrant struct {
 	Targets Aliases        `json:"target"`
 	Attrs   []nodecap.Cap  `json:"attr,omitempty"`
@@ -2308,16 +2347,43 @@ func validateAutogroupForNodeAttrs(ag *AutoGroup) error {
 	return nil
 }
 
-// validateNodeAttrIPPool rejects ipPool entries outside the CGNAT range or
-// overlapping the Tailscale-reserved subranges (MagicDNS, Quad100/IPN). A
-// [netip.Prefix] is considered "within" CGNAT when it is at least as specific as
-// 100.64.0.0/10 and its first address lies inside it.
-func validateNodeAttrIPPool(prefix netip.Prefix) error {
-	cgnat := tsaddr.CGNATRange()
-	masked := prefix.Masked()
+var privateIPv4PoolRanges = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+}
 
-	if masked.Bits() < cgnat.Bits() || !cgnat.Contains(masked.Addr()) {
+var privateIPv6PoolRange = netip.MustParsePrefix("fc00::/7")
+
+// validateNodeAttrIPPool accepts private IPv4 ranges and IPv6 ULA ranges while
+// keeping Tailscale's internal MagicDNS and Quad100/IPN addresses allocatable
+// by the control plane only.
+func validateNodeAttrIPPool(prefix netip.Prefix) error {
+	masked := prefix.Masked()
+	tooSmall := false
+
+	allowed := false
+	if masked.Addr().Is4() {
+		for _, candidate := range privateIPv4PoolRanges {
+			if masked.Bits() >= candidate.Bits() && candidate.Contains(masked.Addr()) {
+				allowed = true
+				tooSmall = masked.Bits() > 30
+
+				break
+			}
+		}
+	} else if masked.Addr().Is6() && masked.Bits() >= privateIPv6PoolRange.Bits() && privateIPv6PoolRange.Contains(masked.Addr()) {
+		allowed = true
+		tooSmall = masked.Bits() > 126
+	}
+
+	if !allowed {
 		return fmt.Errorf("%w: %q", ErrNodeAttrsIPPoolOutOfRange, prefix)
+	}
+
+	if tooSmall {
+		return fmt.Errorf("%w: %q must be IPv4 /30 or larger, or IPv6 /126 or larger", ErrNodeAttrsIPPoolTooSmall, prefix)
 	}
 
 	for _, reserved := range reservedTSRanges {
@@ -2327,6 +2393,68 @@ func validateNodeAttrIPPool(prefix netip.Prefix) error {
 	}
 
 	return nil
+}
+
+func (p *Policy) validateNodeAttrIPPools() []error {
+	var errs []error
+
+	seen := make(map[string]struct{})
+	type namedPrefix struct {
+		user   string
+		prefix netip.Prefix
+	}
+
+	var prefixes []namedPrefix
+
+	for _, na := range p.NodeAttrs {
+		if len(na.IPPool) == 0 {
+			continue
+		}
+
+		if len(na.Targets) != 1 {
+			errs = append(errs, fmt.Errorf("%w: got %d targets", ErrNodeAttrsIPPoolTarget, len(na.Targets)))
+
+			continue
+		}
+
+		username, ok := na.Targets[0].(*Username)
+		if !ok || strings.HasPrefix(string(*username), "user:*@") {
+			errs = append(errs, fmt.Errorf("%w: got %q", ErrNodeAttrsIPPoolTarget, na.Targets[0]))
+
+			continue
+		}
+
+		user := strings.TrimSuffix(username.String(), "@")
+		if _, exists := seen[user]; exists {
+			errs = append(errs, fmt.Errorf("%w: %q", ErrNodeAttrsIPPoolDuplicate, username))
+		}
+		seen[user] = struct{}{}
+
+		for _, prefix := range na.IPPool {
+			if prefix != prefix.Masked() {
+				errs = append(errs, fmt.Errorf("%w: %q has host bits set", ErrNodeAttrsIPPoolOutOfRange, prefix))
+
+				continue
+			}
+
+			if err := validateNodeAttrIPPool(prefix); err != nil {
+				errs = append(errs, err)
+
+				continue
+			}
+
+			for _, previous := range prefixes {
+				if prefix.Overlaps(previous.prefix) {
+					errs = append(errs, fmt.Errorf("%w: %q (%s) overlaps %q (%s)",
+						ErrNodeAttrsIPPoolOverlap, prefix, username, previous.prefix, previous.user))
+				}
+			}
+
+			prefixes = append(prefixes, namedPrefix{user: username.String(), prefix: prefix})
+		}
+	}
+
+	return errs
 }
 
 func validateAutogroupForSSHSrc(src *AutoGroup) error {
@@ -2983,17 +3111,9 @@ func (p *Policy) validate() error {
 			}
 		}
 
-		if len(na.IPPool) > 0 {
-			errs = append(errs, ErrNodeAttrIPPoolUnsupported)
-		}
-
-		for _, prefix := range na.IPPool {
-			err := validateNodeAttrIPPool(prefix)
-			if err != nil {
-				errs = append(errs, err)
-			}
-		}
 	}
+
+	errs = append(errs, p.validateNodeAttrIPPools()...)
 
 	for tag, tagOwners := range p.TagOwners {
 		for _, tagOwner := range tagOwners {

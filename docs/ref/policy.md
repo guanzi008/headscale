@@ -214,6 +214,8 @@ configuration and attributes. At least the following node attributes are current
   port 41641.
 - `disable-captive-portal-detection`: [Disable automatic captive portal
   detection](https://tailscale.com/docs/integrations/captive-portals#disable-captive-portal-detection).
+- `ipPool`: Assign private IPv4 ranges or IPv6 ULA ranges to one Headscale
+  user's untagged devices. See [per-user address pools](#per-user-address-pools).
 - `ssh-behavior-v1`: Run Tailscale SSH sessions on a Linux node without `su`, PAM or a login environment, so `ssh -tt`
   keeps job control but `~/.profile` is not read. Tailscale's own control plane sets it on every node; Headscale leaves
   it off.
@@ -229,6 +231,55 @@ configuration and attributes. At least the following node attributes are current
   ]
 }
 ```
+
+### Per-user address pools
+
+The `ipPool` node attribute gives one Headscale user a private address pool.
+The target must be exactly one user, referenced as `username@`. Groups, tags,
+wildcards, and `user:*@domain` targets are not accepted for `ipPool`.
+
+```json title="policy.json"
+{
+  "nodeAttrs": [
+    {
+      "target": ["alice@"],
+      "ipPool": ["10.42.0.0/24", "fd42:42::/64"]
+    },
+    {
+      "target": ["bob@"],
+      "ipPool": ["10.43.0.0/24", "fd42:43::/64"]
+    }
+  ]
+}
+```
+
+New untagged devices owned by the user receive addresses from the matching
+family in the pool. If a pool contains no range for one family, that family
+continues to use the global allocation range and strategy. Tagged devices are
+not owned by a user and always use global allocation.
+
+Address pools must satisfy these rules:
+
+- IPv4 ranges must be inside `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, or `100.64.0.0/10`, and must be `/30` or larger.
+- IPv6 ranges must be ULA ranges inside `fc00::/7`, and must be `/126` or
+  larger.
+- Pools must not overlap another user's pool or an existing node address.
+- A user's existing addresses must stay inside the pool for every address
+  family the pool defines. Headscale does not migrate addresses automatically.
+- `100.100.100.0/24` (MagicDNS and TSMP) and `100.115.92.0/23` (Quad100 and the
+  IPN service range) are reserved and cannot be assigned to a user.
+
+Headscale reserves every configured user pool from global allocation. When a
+custom IPv4 pool exists, clients are told to disable the special CGNAT route
+and use exact `/32` host routes for node addresses; Quad100 and MagicDNS keep
+their dedicated handling. Headscale also publishes the reverse-DNS zones needed
+for MagicDNS when a pool is outside the built-in CGNAT and Tailscale ULA ranges.
+
+These routes avoid stealing traffic for a private range from the correct node,
+but they cannot resolve a conflict with a local LAN or another VPN route. Pick
+a pool that does not overlap the networks attached to the devices that will use
+it.
 
 ## Network-wide policy options
 

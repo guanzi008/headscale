@@ -296,7 +296,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	// rules are derived from these compiled grants.
 	grants := pol.compileGrants(pm.users, pm.nodes)
 
-	userIPPools, err := compileUserIPPools(pol, pm.users, pm.nodes)
+	userIPPools, err := compileUserIPPools(pol, pm.users)
 	if err != nil {
 		return false, fmt.Errorf("compiling nodeAttrs ipPool: %w", err)
 	}
@@ -326,7 +326,8 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	refreshNodeAttrs := pm.pol == nil ||
 		len(pm.pol.NodeAttrs) > 0 ||
 		pm.pol.RandomizeClientPort ||
-		len(pm.nodeAttrsHashes) > 0
+		len(pm.nodeAttrsHashes) > 0 ||
+		nodesHavePrivateIPv4(pm.nodes)
 
 	var nodeAttrs map[types.NodeID]tailcfg.NodeCapMap
 	if refreshNodeAttrs {
@@ -751,6 +752,17 @@ func (pm *PolicyManager) SetPolicy(polB []byte) (bool, error) {
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	pools, err := compileUserIPPools(pol, pm.users)
+	if err != nil {
+		return false, err
+	}
+	if err := validateUserIPPoolChanges(pools, pm.userIPPools, pm.nodes); err != nil {
+		return false, err
+	}
+	if err := validateUnresolvedIPPoolChanges(pol, pm.pol, pm.users, pm.nodes); err != nil {
+		return false, err
+	}
 
 	// Log policy metadata for debugging
 	log.Debug().
@@ -2353,6 +2365,24 @@ func (pm *PolicyManager) IPPools() map[types.UserID][]netip.Prefix {
 		pools[id] = slices.Clone(prefixes)
 	}
 
+	return pools
+}
+
+// ReservedIPPools includes unresolved user references: deleting a user does
+// not let global allocation consume a range still reserved in the policy.
+func (pm *PolicyManager) ReservedIPPools() []netip.Prefix {
+	if pm == nil {
+		return nil
+	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.pol == nil {
+		return nil
+	}
+	var pools []netip.Prefix
+	for _, attr := range pm.pol.NodeAttrs {
+		pools = append(pools, attr.IPPool...)
+	}
 	return pools
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -21,6 +22,47 @@ var mpp = func(pref string) *netip.Prefix {
 }
 
 var na = netip.MustParseAddr
+
+func TestIPAllocatorSkipsLargeReservedIPv6Pool(t *testing.T) {
+	alloc, err := NewIPAllocator(nil, nil, mpp("fd7a:115c:a1e0::/48"), types.IPAllocationStrategySequential)
+	require.NoError(t, err)
+	require.NoError(t, alloc.SetReservedPools([]netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::/64")}))
+
+	done := make(chan *netip.Addr, 1)
+	go func() {
+		_, ip, _ := alloc.Next()
+		done <- ip
+	}()
+	select {
+	case ip := <-done:
+		require.NotNil(t, ip)
+		assert.Equal(t, na("fd7a:115c:a1e0:1::"), *ip)
+	case <-time.After(time.Second):
+		t.Fatal("allocation scanned addresses inside the reserved IPv6 /64")
+	}
+}
+
+func TestIPAllocatorEntireIPv6PrefixReserved(t *testing.T) {
+	for _, strategy := range []types.IPAllocationStrategy{types.IPAllocationStrategySequential, types.IPAllocationStrategyRandom} {
+		t.Run(string(strategy), func(t *testing.T) {
+			prefix := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+			alloc, err := NewIPAllocator(nil, nil, &prefix, strategy)
+			require.NoError(t, err)
+			require.NoError(t, alloc.SetReservedPools([]netip.Prefix{prefix}))
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := alloc.Next()
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				assert.ErrorIs(t, err, ErrCouldNotAllocateIP)
+			case <-time.After(time.Second):
+				t.Fatal("allocation did not detect an entirely reserved IPv6 prefix")
+			}
+		})
+	}
+}
 
 var nap = func(pref string) *netip.Addr {
 	n := na(pref)

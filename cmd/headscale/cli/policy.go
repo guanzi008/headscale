@@ -51,7 +51,19 @@ func validateOfflinePolicy(d *db.HSDatabase, policyBytes []byte) error {
 
 	// SetPolicy enforces user references, tests, and sshTests for writes;
 	// the constructor permits stored policies whose tests no longer pass.
-	pm, err := policy.NewPolicyManager(policyBytes, users, nodes.ViewSlice())
+	var previous []byte
+	stored, err := d.GetPolicy()
+	if err != nil && !errors.Is(err, types.ErrPolicyNotFound) {
+		return fmt.Errorf("loading current policy for validation: %w", err)
+	}
+	if stored != nil {
+		previous = []byte(stored.Data)
+	}
+	pm, err := policy.NewPolicyManager(previous, users, nodes.ViewSlice())
+	if err != nil {
+		// Bypass mode is also the recovery path for invalid stored policy.
+		pm, err = policy.NewPolicyManager(nil, users, nodes.ViewSlice())
+	}
 	if err != nil {
 		return fmt.Errorf("parsing policy file: %w", err)
 	}

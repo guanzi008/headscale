@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -193,12 +194,12 @@ func prefixListHasFamily(prefixes []netip.Prefix, ipv4 bool) bool {
 	return false
 }
 
-// compileUserIPPools resolves nodeAttrs.ipPool entries to their owning users
-// and verifies that existing addresses can keep their current assignment.
+// compileUserIPPools resolves nodeAttrs.ipPool entries to their owning users.
+// As with other policy references, a deleted or not-yet-created user must not
+// prevent runtime updates or startup. Its ranges remain globally reserved.
 func compileUserIPPools(
 	pol *Policy,
 	users types.Users,
-	nodes views.Slice[types.NodeView],
 ) (map[types.UserID][]netip.Prefix, error) {
 	pools := make(map[types.UserID][]netip.Prefix)
 	if pol == nil {
@@ -217,6 +218,9 @@ func compileUserIPPools(
 			return nil, fmt.Errorf("%w: got %q", ErrNodeAttrsIPPoolTarget, na.Targets[0])
 		}
 		user, err := username.resolveUser(users)
+		if errors.Is(err, ErrUserNotFound) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("resolving nodeAttrs ipPool target %q: %w", username, err)
 		}
@@ -229,14 +233,24 @@ func compileUserIPPools(
 		pools[userID] = prefixes
 	}
 
+	return pools, nil
+}
+
+// validateUserIPPoolChanges checks new allocation rules at the policy-write
+// boundary. Existing addresses survive later ownership/tag changes, so an
+// unchanged pool must not be validated again against those changed owners.
+func validateUserIPPoolChanges(pools, previous map[types.UserID][]netip.Prefix, nodes views.Slice[types.NodeView]) error {
 	for userID, prefixes := range pools {
+		if slices.Equal(prefixes, previous[userID]) {
+			continue
+		}
 		for _, node := range nodes.All() {
 			owner := node.TypedUserID()
 			for _, addr := range node.IPs() {
 				contained := prefixListContains(prefixes, addr)
 				if !node.IsTagged() && owner == userID {
 					if prefixListHasFamily(prefixes, addr.Is4()) && !contained {
-						return nil, fmt.Errorf("%w: node %d (%s) has %s outside the pool for user %d",
+						return fmt.Errorf("%w: node %d (%s) has %s outside the pool for user %d",
 							ErrNodeAttrsIPPoolNodeConflict, node.ID(), node.GivenName(), addr, userID)
 					}
 
@@ -244,14 +258,64 @@ func compileUserIPPools(
 				}
 
 				if contained {
-					return nil, fmt.Errorf("%w: pool for user %d contains node %d (%s) address %s",
+					return fmt.Errorf("%w: pool for user %d contains node %d (%s) address %s",
 						ErrNodeAttrsIPPoolNodeConflict, userID, node.ID(), node.GivenName(), addr)
 				}
 			}
 		}
 	}
 
-	return pools, nil
+	return nil
+}
+
+// Missing users have no entry in the resolved pool map. New reservations for
+// them still need overlap checks; unchanged orphaned pools retain addresses
+// belonging to devices whose owner has since changed.
+func validateUnresolvedIPPoolChanges(pol, previous *Policy, users types.Users, nodes views.Slice[types.NodeView]) error {
+	for _, attr := range pol.NodeAttrs {
+		if len(attr.IPPool) == 0 {
+			continue
+		}
+		username, ok := attr.Targets[0].(*Username)
+		if !ok {
+			continue
+		}
+		if _, err := username.resolveUser(users); !errors.Is(err, ErrUserNotFound) {
+			continue
+		}
+		prefixes := slices.SortedFunc(slices.Values(attr.IPPool), netip.Prefix.Compare)
+		unchanged := previous != nil && slices.ContainsFunc(previous.NodeAttrs, func(old NodeAttrGrant) bool {
+			if len(old.Targets) != 1 {
+				return false
+			}
+			oldName, ok := old.Targets[0].(*Username)
+			return ok && strings.TrimSuffix(oldName.String(), "@") == strings.TrimSuffix(username.String(), "@") &&
+				slices.Equal(prefixes, slices.SortedFunc(slices.Values(old.IPPool), netip.Prefix.Compare))
+		})
+		if unchanged {
+			continue
+		}
+		for _, node := range nodes.All() {
+			for _, addr := range node.IPs() {
+				if prefixListContains(prefixes, addr) {
+					return fmt.Errorf("%w: pool for unregistered user %q contains node %d (%s) address %s",
+						ErrNodeAttrsIPPoolNodeConflict, username, node.ID(), node.GivenName(), addr)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func nodesHavePrivateIPv4(nodes views.Slice[types.NodeView]) bool {
+	for _, node := range nodes.All() {
+		for _, ip := range node.IPs() {
+			if ip.Is4() && ip.IsPrivate() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // compileNodeAttrs returns the per-node CapMap derived from policy
@@ -270,7 +334,8 @@ func (pol *Policy) compileNodeAttrs(
 		return empty, nil
 	}
 
-	if len(pol.NodeAttrs) == 0 && !pol.RandomizeClientPort {
+	hasPrivateIPv4 := nodesHavePrivateIPv4(nodes)
+	if len(pol.NodeAttrs) == 0 && !pol.RandomizeClientPort && !hasPrivateIPv4 {
 		return empty, nil
 	}
 
@@ -317,7 +382,7 @@ func (pol *Policy) compileNodeAttrs(
 			return prefix.Addr().Is4()
 		})
 	})
-	if hasCustomIPv4Pool {
+	if hasCustomIPv4Pool || hasPrivateIPv4 {
 		for _, ni := range nodeList {
 			stamp(ni.id, nodecap.OneCGNATDisable)
 		}

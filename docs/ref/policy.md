@@ -258,6 +258,16 @@ family in the pool. If a pool contains no range for one family, that family
 continues to use the global allocation range and strategy. Tagged devices are
 not owned by a user and always use global allocation.
 
+Existing devices keep their assigned addresses when their pool is cleared or
+they become tagged. Wildcard ACLs, exact host routes, and MagicDNS reverse
+lookups continue to cover those registered private addresses. Pool conflict
+checks apply when a pool is added or changed, rather than when an existing
+device changes owner.
+
+A deleted or not-yet-created user does not prevent Headscale from starting.
+Its policy entry stays reserved from global allocation until the entry is
+removed, so recreating the user cannot collide with another user's new device.
+
 Address pools must satisfy these rules:
 
 - IPv4 ranges must be inside `10.0.0.0/8`, `172.16.0.0/12`,

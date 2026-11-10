@@ -6,12 +6,141 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 )
+
+func TestDeleteIPPoolOwnerKeepsPolicyAndRestartWorking(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if s != nil {
+			_ = s.Close()
+		}
+	})
+	alice := s.CreateUserForTest("alice")
+	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
+	_, _, err = s.UpdatePolicy([]byte(`{"nodeAttrs":[{"target":["alice@"],"ipPool":["100.64.0.0/29"]}]}`))
+	require.NoError(t, err)
+	_, err = s.DeleteUser(types.UserID(alice.ID))
+	require.NoError(t, err)
+	_, err = s.GetUserByName("alice")
+	require.ErrorIs(t, err, db.ErrUserNotFound)
+	require.NoError(t, s.Close())
+	s = nil
+	s, err = NewState(cfg)
+	require.NoError(t, err)
+	// A dangling user reference must stay reserved, so recreating the user
+	// cannot find that another user's new device took its pool in between.
+	ip, _, err := s.ipAlloc.Next()
+	require.NoError(t, err)
+	require.NotNil(t, ip)
+	assert.Equal(t, netip.MustParseAddr("100.64.0.8"), *ip)
+}
+
+func TestPoolNodeTaggingPreservesAddressesAndRestart(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if s != nil {
+			_ = s.Close()
+		}
+	})
+	alice := s.CreateUserForTest("alice")
+	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
+	_, _, err = s.UpdatePolicy([]byte(`{"tagOwners":{"tag:server":["alice@"]},"nodeAttrs":[{"target":["alice@"],"ipPool":["10.42.0.0/24"]}]}`))
+	require.NoError(t, err)
+	node := registerIPPoolTestNode(t, s, alice, "alice-tagged")
+	ips := node.IPs()
+	tagged, _, err := s.SetNodeTags(node.ID(), []string{"tag:server"})
+	require.NoError(t, err)
+	require.True(t, tagged.IsTagged())
+	assert.Equal(t, ips, tagged.IPs())
+	_, err = s.ReloadPolicy()
+	require.NoError(t, err)
+	// An unrelated policy edit must not reinterpret an already assigned IP
+	// as a new allocation to the node's former owner.
+	_, _, err = s.UpdatePolicy([]byte(`{"tagOwners":{"tag:server":["alice@"]},"nodeAttrs":[{"target":["alice@"],"ipPool":["10.42.0.0/24"]}],"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	s = nil
+	s, err = NewState(cfg)
+	require.NoError(t, err)
+	fresh, ok := s.GetNodeByID(node.ID())
+	require.True(t, ok)
+	assert.True(t, fresh.IsTagged())
+	assert.Equal(t, ips, fresh.IPs())
+}
+
+func TestClearingPoolsKeepsExistingPrivateNodesReachable(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{Proxied: true}
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	alice := s.CreateUserForTest("alice")
+	bob := s.CreateUserForTest("bob")
+	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
+	_, _, err = s.UpdatePolicy([]byte(`{"nodeAttrs":[{"target":["alice@"],"ipPool":["10.42.0.0/24","fd42::/64"]},{"target":["bob@"],"ipPool":["10.43.0.0/24","fd43::/64"]}],"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
+	require.NoError(t, err)
+	a := registerIPPoolTestNode(t, s, alice, "alice-private")
+	b := registerIPPoolTestNode(t, s, bob, "bob-private")
+	_, _, err = s.UpdatePolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
+	require.NoError(t, err)
+	matchers, err := s.MatchersForNode(a)
+	require.NoError(t, err)
+	assert.True(t, a.CanAccess(matchers, b), "clearing a pool must not revoke wildcard access")
+	assert.Contains(t, s.NodeCapMap(a.ID()), nodecap.OneCGNATDisable)
+	for _, addr := range a.IPs() {
+		prefix := netip.PrefixFrom(addr, addr.BitLen())
+		var zones []string
+		if addr.Is4() {
+			for _, zone := range util.GenerateIPv4DNSRootDomain(prefix) {
+				zones = append(zones, zone.WithoutTrailingDot())
+			}
+		} else {
+			for _, zone := range util.GenerateIPv6DNSRootDomain(prefix) {
+				zones = append(zones, zone.WithoutTrailingDot())
+			}
+		}
+		for _, zone := range zones {
+			assert.Contains(t, cfg.CloneTailcfgDNSConfig().Routes, zone)
+		}
+	}
+	newNode := registerIPPoolTestNode(t, s, alice, "alice-global")
+	assert.Contains(t, newNode.IPs(), netip.MustParseAddr("100.64.0.1"))
+}
+
+func registerIPPoolTestNode(t *testing.T, s *State, user *types.User, hostname string) types.NodeView {
+	t.Helper()
+	authKey, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+	node, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{AuthKey: authKey.Key}, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: hostname},
+	}, key.NewMachine().Public())
+	require.NoError(t, err)
+	return node
+}
+
+func TestPolicyCanRepairInvalidStoredPolicy(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	_, err = s.db.SetPolicy(`{"nodeAttrs":`)
+	require.NoError(t, err)
+	_, _, err = s.UpdatePolicy([]byte(`{}`))
+	require.NoError(t, err)
+	stored, err := s.GetPolicy()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{}`, stored.Data)
+}
 
 func TestUserIPPoolsAreReservedAcrossPolicyUpdates(t *testing.T) {
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")

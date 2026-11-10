@@ -104,6 +104,10 @@ type PolicyManager interface {
 	// map and slices are caller-owned.
 	IPPools() map[types.UserID][]netip.Prefix
 
+	// ReservedIPPools returns every configured range, including ranges whose
+	// target user is absent. The returned slice is caller-owned.
+	ReservedIPPools() []netip.Prefix
+
 	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
 	// CapMap shifted during recent updateLocked calls. The buffer
 	// drains on read; callers consume it once per update cycle to

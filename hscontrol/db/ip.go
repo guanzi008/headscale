@@ -343,40 +343,52 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 		}
 	}
 
-	// TODO(kradalby): maybe this can be done less often.
 	set, err := i.usedIPs.IPSet()
 	if err != nil {
 		return nil, err
 	}
 
-	// Walk forward from the starting address until a free, non-reserved
-	// address inside the prefix is found. The random strategy only picks the
-	// starting point at random and then scans deterministically: this keeps
-	// the loop finite, so an exhausted prefix returns ErrCouldNotAllocateIP
-	// instead of re-drawing in-prefix addresses forever under i.mu.
+	// Subtract whole ranges before choosing an address. Walking every address
+	// in a reserved IPv6 /64 would hold mu for effectively unbounded time.
+	var available netipx.IPSetBuilder
+	available.AddPrefix(*prefix)
+	available.RemoveSet(set)
+	available.RemoveSet(&i.reservedPools)
+	available.RemovePrefix(tsaddr.ChromeOSVMRange())
+	available.Remove(tsaddr.TailscaleServiceIP())
+	available.Remove(tsaddr.TailscaleServiceIPv6())
+	free, err := available.IPSet()
+	if err != nil {
+		return nil, err
+	}
+	ranges := free.Ranges()
+	if len(ranges) == 0 {
+		return nil, ErrCouldNotAllocateIP
+	}
+
 	if !prefix.Contains(ip) {
 		ip = prefix.Masked().Addr()
 	}
 
-	start := ip
-	for {
-		if !set.Contains(ip) && !i.reservedPools.Contains(ip) && !isTailscaleReservedIP(ip) {
+	for _, rang := range ranges {
+		if rang.Contains(ip) {
 			i.usedIPs.Add(ip)
 
 			return &ip, nil
 		}
+		if rang.From().Compare(ip) > 0 {
+			next := rang.From()
+			i.usedIPs.Add(next)
 
-		ip = ip.Next()
-
-		// Wrap so addresses freed behind the cursor can be reused.
-		if !prefix.Contains(ip) {
-			ip = prefix.Masked().Addr()
-		}
-
-		if ip == start {
-			return nil, ErrCouldNotAllocateIP
+			return &next, nil
 		}
 	}
+
+	// No free range follows the cursor; reuse an address behind it.
+	next := ranges[0].From()
+	i.usedIPs.Add(next)
+
+	return &next, nil
 }
 
 func randomNext(pfx netip.Prefix) (netip.Addr, error) {

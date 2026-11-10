@@ -373,13 +373,24 @@ func TestNodeAttrsIPPoolUserValidation(t *testing.T) {
 			policy:  `{"nodeAttrs":[{"target":["carol@example.net"],"ipPool":["100.64.0.0/24"]}]}`,
 			wantErr: ErrNodeAttrsIPPoolNodeConflict,
 		},
+		{
+			name:    "unregistered user's pool cannot contain existing nodes",
+			policy:  `{"nodeAttrs":[{"target":["future-user@"],"ipPool":["100.64.0.0/24"]}]}`,
+			wantErr: ErrNodeAttrsIPPoolNodeConflict,
+		},
+		{
+			name:   "unregistered user can reserve a free pool",
+			policy: `{"nodeAttrs":[{"target":["future-user@"],"ipPool":["10.70.0.0/24"]}]}`,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			pm, err := NewPolicyManager([]byte(tt.policy), baseUsers, baseNodes.ViewSlice())
+			pm, err := NewPolicyManager(nil, baseUsers, baseNodes.ViewSlice())
+			require.NoError(t, err)
+			_, err = pm.SetPolicy([]byte(tt.policy))
 			if tt.wantErr != nil {
 				require.Error(t, err)
 				assert.ErrorIs(t, err, tt.wantErr)

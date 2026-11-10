@@ -395,33 +395,18 @@ func (a Asterix) Resolve(p *Policy, u types.Users, n views.Slice[types.NodeView]
 	return newResolvedAddresses(a.resolve(p, u, n))
 }
 
-func nodeAddressInPolicyIPPool(p *Policy, node types.NodeView) bool {
-	if p == nil {
-		return false
-	}
-
-	for _, attrs := range p.NodeAttrs {
-		for _, prefix := range attrs.IPPool {
-			if slices.ContainsFunc(node.IPs(), prefix.Contains) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-func (a Asterix) resolve(p *Policy, _ types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
+func (a Asterix) resolve(_ *Policy, _ types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
 	var builder netipx.IPSetBuilder
 	builder.AddSet(asterixResolved())
 
-	// A nodeAttrs ipPool can put a node outside the CGNAT and Tailscale ULA
-	// ranges. Wildcards still mean "every node", so include the addresses the
-	// current nodes actually hold in an explicit pool rather than expanding to
-	// unrelated addresses from older or manually edited node records.
+	// Pool changes affect future allocations, not registered node addresses.
+	// Keep their private addresses covered even after the pool is cleared or
+	// the node becomes tagged. Public addresses in legacy/manual rows stay out.
 	for _, node := range nodes.All() {
-		if nodeAddressInPolicyIPPool(p, node) {
-			node.AppendToIPSet(&builder)
+		for _, ip := range node.IPs() {
+			if ip.IsPrivate() {
+				builder.Add(ip)
+			}
 		}
 	}
 

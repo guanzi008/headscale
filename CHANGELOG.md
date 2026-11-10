@@ -94,6 +94,12 @@ is not connected, or refuses is "not found". See [the client docs](https://heads
 
 ### Per-user address pools
 
+Address allocation skips reserved ranges as whole intervals, including large
+IPv6 pools. Removing a pool preserves existing private-node wildcard access,
+host routes, and reverse DNS. Deleting a pool owner or tagging an existing
+device no longer leaves policy updates or server startup failing; new and
+changed pools still reject overlaps with existing devices.
+
 Headscale policy files can now assign private IPv4 ranges or IPv6 ULA ranges to
 an individual user with `nodeAttrs.ipPool`. Untagged devices owned by that user
 allocate from their pool, while global allocation reserves every configured

@@ -487,7 +487,7 @@ func NewState(cfg *types.Config) (*State, error) {
 	// Surface nodes whose stored data would break map generation (e.g. an
 	// invalid given name from a legacy row) so an operator can fix them. This
 	// only logs; it never mutates a node's stored name at boot.
-	syncIPPoolDNSRoutes(cfg, polMan)
+	syncIPPoolDNSRoutes(cfg, polMan, s.ListNodes())
 	s.logNodeHealth()
 
 	return s, nil
@@ -497,22 +497,23 @@ func NewState(cfg *types.Config) (*State, error) {
 // nodeAttrs.ipPool. Per-user allocation still passes its pool explicitly and
 // is therefore not blocked by this reservation.
 func syncReservedIPPools(alloc *hsdb.IPAllocator, polMan policy.PolicyManager) error {
-	var prefixes []netip.Prefix
-	for _, pools := range polMan.IPPools() {
-		prefixes = append(prefixes, pools...)
-	}
-
-	return alloc.SetReservedPools(prefixes)
+	return alloc.SetReservedPools(polMan.ReservedIPPools())
 }
 
 // syncIPPoolDNSRoutes gives MagicDNS reverse zones to pools outside Tailscale's
 // built-in CGNAT and ULA ranges. Without this, a node using an address such as
 // 10.42.0.1 cannot resolve its own MagicDNS reverse name even though the
 // forward name and exact host route work.
-func syncIPPoolDNSRoutes(cfg *types.Config, polMan policy.PolicyManager) bool {
-	var prefixes []netip.Prefix
-	for _, pools := range polMan.IPPools() {
-		prefixes = append(prefixes, pools...)
+func syncIPPoolDNSRoutes(cfg *types.Config, polMan policy.PolicyManager, nodes views.Slice[types.NodeView]) bool {
+	prefixes := polMan.ReservedIPPools()
+	// Retained addresses need reverse zones even after their allocation pool
+	// is removed. Host zones avoid capturing unrelated private subnet DNS.
+	for _, node := range nodes.All() {
+		for _, ip := range node.IPs() {
+			if ip.IsPrivate() {
+				prefixes = append(prefixes, netip.PrefixFrom(ip, ip.BitLen()))
+			}
+		}
 	}
 
 	return cfg.SetIPPoolDNSRoutes(prefixes)
@@ -645,7 +646,7 @@ func (s *State) reloadPolicyLocked() (bool, bool, error) {
 		return false, false, fmt.Errorf("reserving policy IP pools: %w", err)
 	}
 
-	syncIPPoolDNSRoutes(s.cfg, s.polMan)
+	syncIPPoolDNSRoutes(s.cfg, s.polMan, s.ListNodes())
 
 	// Checked even when the policy is unchanged: [State.SetPolicy] may have
 	// installed it already.
@@ -1839,7 +1840,7 @@ func (s *State) SetPolicy(pol []byte) (bool, error) {
 		return changed, fmt.Errorf("reserving policy IP pools: %w", err)
 	}
 
-	syncIPPoolDNSRoutes(s.cfg, s.polMan)
+	syncIPPoolDNSRoutes(s.cfg, s.polMan, s.ListNodes())
 
 	// Payload-only writes reuse the cached adjacency, so a policy swap
 	// must rebuild it here rather than wait for the next relation write.
@@ -1947,7 +1948,16 @@ func (s *State) ValidatePolicy(pol []byte) error {
 
 	nodes := s.ListNodes()
 
-	pm, err := policy.NewPolicyManager(nil, users, nodes)
+	previous, err := hsdb.PolicyBytes(s.db.DB, s.cfg)
+	if err != nil {
+		return fmt.Errorf("loading current policy for validation: %w", err)
+	}
+	pm, err := policy.NewPolicyManager(previous, users, nodes)
+	if err != nil {
+		// Invalid stored policy must not prevent replacing it with a valid
+		// policy. With no usable baseline, check every new pool strictly.
+		pm, err = policy.NewPolicyManager(nil, users, nodes)
+	}
 	if err != nil {
 		return fmt.Errorf("creating policy manager: %w", err)
 	}
@@ -4151,7 +4161,7 @@ func (s *State) updatePolicyManagerUsers() (change.Change, error) {
 	if err := syncReservedIPPools(s.ipAlloc, s.polMan); err != nil {
 		return change.Change{}, fmt.Errorf("reserving policy IP pools after user update: %w", err)
 	}
-	dnsChanged := syncIPPoolDNSRoutes(s.cfg, s.polMan)
+	dnsChanged := syncIPPoolDNSRoutes(s.cfg, s.polMan, s.ListNodes())
 
 	log.Debug().Caller().Bool("policy.changed", changed).Msg("policy manager user update completed because SetUsers operation finished")
 

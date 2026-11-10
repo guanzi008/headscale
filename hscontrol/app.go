@@ -112,6 +112,7 @@ type Headscale struct {
 	// One per long-poll session, held through its Disconnect cleanup, so
 	// shutdown can close state after waiting on it.
 	clientStreamsOpen sync.WaitGroup
+	console           *consoleTailnets
 }
 
 var (
@@ -502,6 +503,9 @@ func serveHumaMux(mux http.Handler) http.HandlerFunc {
 
 func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 	r := chi.NewRouter()
+	if h.console != nil {
+		r.Use(h.console.middleware)
+	}
 	r.Use(metrics.Collector(metrics.CollectorOpts{
 		Host:  false,
 		Proto: true,
@@ -669,6 +673,13 @@ func (h *Headscale) Serve() error {
 	defer scheduleCancel()
 
 	go h.scheduledTasks(scheduleCtx)
+	if directory := os.Getenv("HEADSCALE_CONSOLE_TAILNETS_DIR"); directory != "" {
+		h.console, err = newConsoleTailnets(scheduleCtx, h, directory, os.Getenv("HEADSCALE_CONSOLE_CONFIG_TEMPLATE"))
+		if err != nil {
+			return fmt.Errorf("initialize personal networks: %w", err)
+		}
+		defer h.console.close()
+	}
 
 	// Prepare group for running listeners
 	errorGroup := new(errgroup.Group)

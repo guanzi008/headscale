@@ -71,15 +71,21 @@ type AuthProviderOIDC struct {
 	h         *Headscale
 	serverURL string
 	cfg       *types.OIDCConfig
+	*oidcAuthCache
 
+	oidcProvider *oidc.Provider
+	oauth2Config *oauth2.Config
+}
+
+// Network providers share the complete pending-state cache, including its
+// admission lock and registration budget. A callback must be single use even
+// when it starts in one network and returns through the common public URL.
+type oidcAuthCache struct {
 	// authCacheMu serializes non-evicting admission and single-use consumption.
 	// Reads use Peek to preserve insertion order, so the oldest entry expires first.
 	authCacheMu            sync.Mutex
 	authCacheRegistrations atomic.Int64
 	authCache              *expirable.LRU[string, AuthInfo]
-
-	oidcProvider *oidc.Provider
-	oauth2Config *oauth2.Config
 }
 
 func NewAuthProviderOIDC(
@@ -104,9 +110,10 @@ func NewAuthProviderOIDC(
 	}
 
 	a := &AuthProviderOIDC{
-		h:         h,
-		serverURL: serverURL,
-		cfg:       cfg,
+		h:             h,
+		serverURL:     serverURL,
+		cfg:           cfg,
+		oidcAuthCache: &oidcAuthCache{},
 
 		oidcProvider: oidcProvider,
 		oauth2Config: oauth2Config,
@@ -375,6 +382,42 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC subject cannot be used as a provider identifier", nil))
 
 		return
+	}
+
+	if manager := a.h.console; manager != nil {
+		target := manager.forAuth(authInfo.AuthID)
+		if target != nil && target.owner.ID != claims.Sub {
+			httpUserError(writer, NewHTTPError(http.StatusForbidden, "this authentication belongs to another network", nil))
+			return
+		}
+		if target == nil {
+			if !authInfo.Registration {
+				httpUserError(writer, NewHTTPError(http.StatusForbidden, "network authentication has expired", nil))
+				return
+			}
+			var err error
+			target, err = manager.ensure(consoleOwner{ID: claims.Sub, Email: claims.Email, Name: claims.Name})
+			if err != nil {
+				httpUserError(writer, NewHTTPError(http.StatusForbidden, "personal network unavailable", err))
+				return
+			}
+			if err := manager.bind(authInfo.AuthID, target); err != nil {
+				httpUserError(writer, NewHTTPError(http.StatusUnauthorized, "registration has expired", err))
+				return
+			}
+		}
+		if !target.acquire() {
+			httpUserError(writer, NewHTTPError(http.StatusForbidden, "personal network unavailable", nil))
+			return
+		}
+		defer target.requests.Done()
+		copy := *a
+		copy.h, copy.cfg = target.h, &target.h.cfg.OIDC
+		a = &copy
+		if err := doOIDCAuthorization(a.cfg, &claims); err != nil {
+			httpUserError(writer, err)
+			return
+		}
 	}
 
 	user, userChange, err := a.createOrUpdateUserFromClaim(&claims)
@@ -944,6 +987,7 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 			return
 		}
 
+		info.Locale = oidcBrowserLocale(req)
 		content = templates.SSHCheckConfirm(info, src.GivenName(), dst.GivenName()).Render()
 	} else {
 		regData := authReq.RegistrationData()
@@ -959,6 +1003,7 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 			info.Tags = regData.Hostinfo.RequestTags
 		}
 
+		info.Locale = oidcBrowserLocale(req)
 		content = templates.RegisterConfirm(info).Render()
 	}
 
@@ -971,6 +1016,21 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 	if _, err := writer.Write([]byte(content)); err != nil { //nolint:noinlineerr
 		util.LogErr(err, "Failed to write HTTP response")
 	}
+}
+
+func oidcBrowserLocale(req *http.Request) string {
+	if cookie, err := req.Cookie("hsc_locale"); err == nil {
+		if strings.HasPrefix(strings.ToLower(cookie.Value), "zh") {
+			return "zh-CN"
+		}
+		if strings.HasPrefix(strings.ToLower(cookie.Value), "en") {
+			return "en"
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(req.Header.Get("Accept-Language")), "zh") {
+		return "zh-CN"
+	}
+	return "en"
 }
 
 // RegisterConfirmHandler is the POST endpoint behind the OIDC

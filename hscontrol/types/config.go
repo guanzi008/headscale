@@ -122,6 +122,7 @@ type NodeConfig struct {
 
 // Config contains the initial Headscale configuration.
 type Config struct {
+	ConsoleTailnetID    string
 	ServerURL           string
 	Addr                string
 	MetricsAddr         string
@@ -540,6 +541,9 @@ func validateOIDCConfig() error {
 // Domain returns the hostname/domain part of the [Config.ServerURL].
 // If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
 func (c *Config) Domain() string {
+	if c.ConsoleTailnetID != "" {
+		return c.BaseDomain
+	}
 	u, err := url.Parse(c.ServerURL)
 	if err != nil {
 		return c.BaseDomain

@@ -4,6 +4,17 @@
 
 **Minimum supported Tailscale client version: v1.84.0**
 
+### Independent networks in Headscale Console
+
+Console deployments can serve independent account networks from one control URL.
+Each network keeps its own SQLite database, policy, DNS, address allocation and
+credentials. Public user and node IDs remain unique across these networks, and
+clients receive a stable network ID. Account deletion revokes its network while
+other networks continue running. This integration is enabled only by the Console
+environment variables; standalone Headscale deployments retain their existing
+behavior. See the Console upgrade instructions before moving a shared deployment
+to private account networks.
+
 ### v1 REST API replaced; gRPC and Protobuf removed
 
 The v1 REST API now provides an OpenAPI 3.1 specification at

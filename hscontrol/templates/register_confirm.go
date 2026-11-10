@@ -18,6 +18,7 @@ import (
 // theirs.
 // The form and user fields are also used for SSH check confirmations.
 type RegisterConfirmInfo struct {
+	Locale string
 	// FormAction is the absolute or relative URL the confirm form
 	// POSTs to. Typically /register/confirm/{auth_id}.
 	FormAction string
@@ -52,6 +53,21 @@ type RegisterConfirmInfo struct {
 	Tags []string
 }
 
+func (info RegisterConfirmInfo) text(english, chinese string) string {
+	if strings.HasPrefix(info.Locale, "zh") {
+		return chinese
+	}
+	return english
+}
+
+func (info RegisterConfirmInfo) page(title string, content ...elem.Node) *elem.Element {
+	result := page(title, content...)
+	if strings.HasPrefix(info.Locale, "zh") {
+		result.Attrs[attrs.Lang] = "zh-CN"
+	}
+	return result
+}
+
 // RegisterConfirm renders an interstitial page that asks the
 // OIDC-authenticated user to explicitly confirm that they want to
 // register the named device under their account. Without this
@@ -60,34 +76,32 @@ type RegisterConfirmInfo struct {
 // IdP allows silent SSO.
 func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 	rows := []deviceRow{
-		{"Hostname", elem.Text(info.Hostname)},
-		{"OS", elem.Text(cmp.Or(info.OS, "(unknown)"))},
-		{"Machine key", Code(elem.Text(info.MachineKey))},
-		{"Existing node", elem.Text(cmp.Or(info.ExistingNode, "None, this is a new device"))},
+		{info.text("Hostname", "设备名称"), elem.Text(info.Hostname)},
+		{info.text("OS", "操作系统"), elem.Text(cmp.Or(info.OS, info.text("(unknown)", "未知")))},
+		{info.text("Machine key", "设备密钥指纹"), Code(elem.Text(info.MachineKey))},
+		{info.text("Existing node", "现有设备"), elem.Text(cmp.Or(info.ExistingNode, info.text("None, this is a new device", "无，这是新设备")))},
 	}
 	if len(info.Tags) > 0 {
 		rows = append(rows,
-			deviceRow{"Registered to", elem.Text(strings.Join(info.Tags, ", "))},
-			deviceRow{"Approved by", elem.Text(info.User)},
+			deviceRow{info.text("Registered to", "归属"), elem.Text(strings.Join(info.Tags, ", "))},
+			deviceRow{info.text("Approved by", "批准人"), elem.Text(info.User)},
 		)
 	} else {
-		rows = append(rows, deviceRow{"Registered to", elem.Text(info.User)})
+		rows = append(rows, deviceRow{info.text("Registered to", "归属"), elem.Text(info.User)})
 	}
 
 	deviceList := deviceTable(rows)
 
-	return page(
-		"Headscale - Confirm node registration",
-		H2(elem.Text("Confirm node registration")),
+	return info.page(
+		info.text("Headscale - Confirm node registration", "Headscale - 确认设备注册"),
+		H2(elem.Text(info.text("Confirm node registration", "确认设备注册"))),
 		P(elem.Text(
-			"A device is asking to be added to your tailnet. "+
-				"Please review the details below and confirm that this device is yours.",
+			info.text("A device is asking to be added to your tailnet. Please review the details below and confirm that this device is yours.", "有一台设备请求加入你的网络。请核实以下信息，确认这是你的设备。"),
 		)),
 		deviceList,
-		confirmForm(info, "Confirm registration"),
+		confirmForm(info, info.text("Confirm registration", "确认注册")),
 		P(elem.Text(
-			"If you do not recognise this device, close this window. "+
-				"The registration request will expire automatically.",
+			info.text("If you do not recognise this device, close this window. The registration request will expire automatically.", "如果你不认识此设备，请关闭窗口，注册请求会自动过期。"),
 		)),
 	)
 }
@@ -97,26 +111,23 @@ func SSHCheckConfirm(
 	info RegisterConfirmInfo,
 	source, destination string,
 ) *elem.Element {
-	return page(
-		"Headscale - Confirm SSH session",
-		H2(elem.Text("Confirm SSH session")),
+	return info.page(
+		info.text("Headscale - Confirm SSH session", "Headscale - 确认 SSH 会话"),
+		H2(elem.Text(info.text("Confirm SSH session", "确认 SSH 会话"))),
 		P(elem.Text(
-			"An SSH session is waiting for your approval. "+
-				"Review the source and destination nodes before continuing.",
+			info.text("An SSH session is waiting for your approval. Review the source and destination nodes before continuing.", "有一个 SSH 会话等待批准，请先核实来源设备和目标设备。"),
 		)),
 		deviceTable([]deviceRow{
-			{"From", elem.Text(source)},
-			{"To", elem.Text(destination)},
-			{"Approved by", elem.Text(info.User)},
+			{info.text("From", "来源设备"), elem.Text(source)},
+			{info.text("To", "目标设备"), elem.Text(destination)},
+			{info.text("Approved by", "批准人"), elem.Text(info.User)},
 		}),
 		P(elem.Text(
-			"Approval also allows new SSH sessions between these two nodes "+
-				"without asking again until the check period ends.",
+			info.text("Approval also allows new SSH sessions between these two nodes without asking again until the check period ends.", "批准后，在检查有效期内，这两台设备之间的新 SSH 会话无需再次批准。"),
 		)),
-		confirmForm(info, "Approve SSH session"),
+		confirmForm(info, info.text("Approve SSH session", "批准 SSH 会话")),
 		P(elem.Text(
-			"If you do not recognise this request, close this window. "+
-				"The request will expire automatically.",
+			info.text("If you do not recognise this request, close this window. The request will expire automatically.", "如果你不认识此请求，请关闭窗口，请求会自动过期。"),
 		)),
 	)
 }

@@ -596,6 +596,19 @@ func (s *State) DERPMap() tailcfg.DERPMapView {
 	return s.derpMap.Load().View()
 }
 
+// ConfiguredDERPMap returns the platform relay map before this network's policy
+// overrides, so a new private network does not inherit another network's policy.
+func (s *State) ConfiguredDERPMap() tailcfg.DERPMapView {
+	s.derpMu.Lock()
+	defer s.derpMu.Unlock()
+	return s.configDERPMap.View()
+}
+
+// UseGlobalIDs installs the public identity allocator for a Console network.
+func (s *State) UseGlobalIDs(allocate func(string) (uint64, error)) error {
+	return s.db.UseGlobalIDs(allocate)
+}
+
 // ReloadPolicy reloads the access control policy.
 //
 // It approves no routes: auto-approval waits for a node's next change to

@@ -124,6 +124,9 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 	tailnode.Cap, tailnode.Online, tailnode.LastSeen = 0, nil, nil
 
 	tailnode.Hostinfo = types.SelfHostinfo(tailnode.Hostinfo)
+	if b.mapper.cfg.ConsoleTailnetID != "" {
+		tailnode.StableTailnetID = tailcfg.StableTailnetID(b.mapper.cfg.ConsoleTailnetID)
+	}
 
 	b.resp.Node = tailnode
 

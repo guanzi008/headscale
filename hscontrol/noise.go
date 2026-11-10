@@ -76,7 +76,8 @@ const (
 )
 
 type noiseServer struct {
-	headscale *Headscale
+	headscale    *Headscale
+	consoleScope *consoleNoiseScope
 
 	conn       *controlbase.Conn
 	machineKey key.MachinePublic
@@ -108,8 +109,9 @@ func (h *Headscale) NoiseUpgradeHandler(
 	}
 
 	ns := noiseServer{
-		headscale: h,
-		challenge: key.NewChallenge(),
+		headscale:    h,
+		challenge:    key.NewChallenge(),
+		consoleScope: &consoleNoiseScope{},
 	}
 
 	noiseConn, err := controlhttpserver.AcceptHTTP(
@@ -163,11 +165,11 @@ func (h *Headscale) NoiseUpgradeHandler(
 	r.Use(middleware.Recoverer)
 
 	r.Route("/machine", func(r chi.Router) {
-		r.Post("/register", ns.RegistrationHandler)
-		r.Post("/map", ns.PollNetMapHandler)
+		r.Post("/register", ns.consoleHandler((*noiseServer).RegistrationHandler))
+		r.Post("/map", ns.consoleHandler((*noiseServer).PollNetMapHandler))
 
 		// SSH Check mode endpoint, consulted to validate if a given SSH connection should be accepted or rejected.
-		r.Get("/ssh/action/{src_node_id}/to/{dst_node_id}", ns.SSHActionHandler)
+		r.Get("/ssh/action/{src_node_id}/to/{dst_node_id}", ns.consoleHandler((*noiseServer).SSHActionHandler))
 
 		// Not implemented yet
 		//
@@ -176,7 +178,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		// https://github.com/tailscale/tailscale/blob/dfba01ca9bd8c4df02c3c32f400d9aeb897c5fc7/cmd/tailscale/cli/debug.go#L1138
 		r.Get("/whoami", ns.NotImplementedHandler)
 
-		r.Post("/set-dns", ns.SetDNSHandler)
+		r.Post("/set-dns", ns.consoleHandler((*noiseServer).SetDNSHandler))
 
 		// A patch of [tailcfg.SetDeviceAttributesRequest] to update device attributes.
 		// We currently do not support device attributes.
@@ -202,7 +204,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 
 		// c2n response endpoint: receives the HTTP response a node produced for a
 		// c2n [tailcfg.PingRequest]. Only the target node's Noise session may answer.
-		r.Post("/c2n-response", ns.C2NResponseHandler)
+		r.Post("/c2n-response", ns.consoleHandler((*noiseServer).C2NResponseHandler))
 	})
 
 	// Serve returns once the listener is drained; the connection outlives it.

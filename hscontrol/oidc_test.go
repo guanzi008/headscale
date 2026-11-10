@@ -236,7 +236,7 @@ func TestExtractCodeAndStateParam(t *testing.T) {
 // resolved twice, so a replayed callback cannot re-bind the same session.
 func TestGetAuthInfoFromStateSingleUse(t *testing.T) {
 	a := &AuthProviderOIDC{
-		authCache: expirable.NewLRU[string, AuthInfo](16, nil, time.Minute),
+		oidcAuthCache: &oidcAuthCache{authCache: expirable.NewLRU[string, AuthInfo](16, nil, time.Minute)},
 	}
 	t.Cleanup(a.authCache.Close)
 	a.authCache.Add("state-x", AuthInfo{Registration: true})
@@ -252,9 +252,10 @@ func newOIDCPendingProvider(t *testing.T, capacity int) *AuthProviderOIDC {
 	t.Helper()
 
 	a := &AuthProviderOIDC{
-		h:         createTestApp(t),
-		serverURL: "https://headscale.example",
-		cfg:       &types.OIDCConfig{},
+		h:             createTestApp(t),
+		serverURL:     "https://headscale.example",
+		cfg:           &types.OIDCConfig{},
+		oidcAuthCache: &oidcAuthCache{},
 		oauth2Config: &oauth2.Config{
 			ClientID: "headscale-test",
 			Endpoint: oauth2.Endpoint{
@@ -273,6 +274,17 @@ func newOIDCPendingProvider(t *testing.T, capacity int) *AuthProviderOIDC {
 	t.Cleanup(a.authCache.Close)
 
 	return a
+}
+
+func TestOIDCStatesShareAdmissionAcrossPersonalNetworks(t *testing.T) {
+	provider := newOIDCPendingProvider(t, 1)
+	require.True(t, provider.addAuthInfoToState("first", AuthInfo{Registration: true}))
+	scoped := *provider
+	require.NotNil(t, scoped.getAuthInfoFromState("first"))
+	require.Nil(t, provider.getAuthInfoFromState("first"), "callbacks remain single use across network providers")
+	require.True(t, scoped.addAuthInfoToState("next", AuthInfo{Registration: true}), "consuming through a network provider must return the shared admission slot")
+	require.NotNil(t, provider.getAuthInfoFromState("next"))
+	require.Zero(t, scoped.authCacheRegistrations.Load())
 }
 
 func oidcPendingAuthRequest(t *testing.T, authID types.AuthID) *http.Request {

@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"encoding/json"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -10,7 +11,92 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
+
+func TestMapResponseBuilder_UserPoolHostRoute(t *testing.T) {
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: t.TempDir() + "/headscale.db"},
+		},
+		PrefixV4: &p4, PrefixV6: &p6,
+		IPAllocation: types.IPAllocationStrategySequential,
+		BaseDomain:   "headscale.test",
+		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Tuning: types.Tuning{
+			NodeStoreBatchSize:    state.TestBatchSize,
+			NodeStoreBatchTimeout: state.TestBatchTimeout,
+		},
+	}
+	s, err := state.NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	user := s.CreateUserForTest("alice")
+	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
+	_, _, err = s.UpdatePolicy([]byte(`{
+		"nodeAttrs":[{"target":["alice@"],"ipPool":["10.42.0.0/24","fd42:1::/64"]}],
+		"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]
+	}`))
+	require.NoError(t, err)
+
+	var nodes []types.NodeView
+	for _, os := range []string{"linux", "android"} {
+		authKey, err := s.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+		require.NoError(t, err)
+		node, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+			Auth:    &tailcfg.RegisterResponseAuth{AuthKey: authKey.Key},
+			NodeKey: key.NewNode().Public(), Hostinfo: &tailcfg.Hostinfo{Hostname: os, OS: os},
+		}, key.NewMachine().Public())
+		require.NoError(t, err)
+		nodes = append(nodes, node)
+	}
+	router, android := nodes[0], nodes[1]
+	route := netip.MustParsePrefix("100.84.4.113/32")
+	_, err = s.UpdateNodeFromMapRequest(router.ID(), tailcfg.MapRequest{
+		NodeKey:  router.NodeKey(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "linux", OS: "linux", RoutableIPs: []netip.Prefix{route}},
+	})
+	require.NoError(t, err)
+	_, _, err = s.SetApprovedRoutes(router.ID(), []netip.Prefix{route})
+	require.NoError(t, err)
+	s.Connect(router.ID())
+	router, ok := s.GetNodeByID(router.ID())
+	require.True(t, ok)
+	m := &mapper{cfg: cfg, state: s}
+
+	for _, enabled := range []bool{true, false, true} {
+		if !enabled {
+			_, _, err = s.UpdatePolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
+		} else {
+			_, _, err = s.UpdatePolicy([]byte(`{
+				"nodeAttrs":[{"target":["alice@"],"ipPool":["10.42.0.0/24","fd42:1::/64"]}],
+				"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]
+			}`))
+		}
+		require.NoError(t, err)
+		resp, err := m.NewMapResponseBuilder(android.ID()).
+			WithCapabilityVersion(tailcfg.CurrentCapabilityVersion).
+			WithPeers(views.SliceOf([]types.NodeView{router})).Build()
+		require.NoError(t, err)
+		require.Len(t, resp.Peers, 1)
+		self, err := m.NewMapResponseBuilder(router.ID()).
+			WithCapabilityVersion(tailcfg.CurrentCapabilityVersion).WithSelfNode().Build()
+		require.NoError(t, err)
+		if enabled {
+			assert.Contains(t, resp.Peers[0].AllowedIPs, route)
+			assert.Contains(t, resp.Peers[0].PrimaryRoutes, route)
+			assert.Contains(t, self.Node.PrimaryRoutes, route)
+		} else {
+			assert.NotContains(t, resp.Peers[0].AllowedIPs, route)
+			assert.NotContains(t, resp.Peers[0].PrimaryRoutes, route)
+			assert.NotContains(t, self.Node.PrimaryRoutes, route)
+		}
+	}
+}
 
 func TestMapResponseBuilder_Basic(t *testing.T) {
 	cfg := &types.Config{

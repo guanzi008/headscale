@@ -24,6 +24,34 @@ import (
 	"tailscale.com/types/views"
 )
 
+func TestNodeStoreTracksAssignedIPs(t *testing.T) {
+	node := createTestNode(1, 1, "alice", "device")
+	first4 := netip.MustParseAddr("10.42.0.1")
+	first6 := netip.MustParseAddr("fd42:1::1")
+	node.IPv4, node.IPv6 = &first4, &first6
+	store := NewNodeStore(types.Nodes{&node}, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+	store.Start()
+	t.Cleanup(store.Stop)
+	assert.True(t, store.IsNodeIP(first4))
+	assert.True(t, store.IsNodeIP(first6))
+	assert.True(t, store.IsNodeIP(netip.MustParseAddr("::ffff:10.42.0.1")))
+	assert.False(t, store.IsNodeIP(netip.MustParseAddr("100.84.4.113")))
+
+	second4 := netip.MustParseAddr("10.43.0.1")
+	_, ok := store.UpdateNode(node.ID, func(n *types.Node) { n.IPv4 = &second4 })
+	require.True(t, ok)
+	assert.False(t, store.IsNodeIP(first4))
+	assert.True(t, store.IsNodeIP(second4))
+	assert.True(t, store.IsNodeIP(first6))
+
+	store.DeleteNode(node.ID)
+	assert.False(t, store.IsNodeIP(second4))
+	assert.False(t, store.IsNodeIP(first6))
+	store.PutNode(node)
+	assert.True(t, store.IsNodeIP(first4))
+	assert.True(t, store.IsNodeIP(first6))
+}
+
 func TestSnapshotFromNodes(t *testing.T) {
 	tests := []struct {
 		name      string

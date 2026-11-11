@@ -4,6 +4,14 @@
 
 **Minimum supported Tailscale client version: v1.84.0**
 
+### User address pools and host routes
+
+Host-route filtering now follows the advertising user's address pools, with
+each configured family replacing its default allocation range. For example,
+a user whose devices use `10.42.0.0/24` can serve `100.84.4.113/32` through a
+subnet router. Existing device addresses remain protected after pool changes.
+The API's serving routes, router self maps and peer maps use the same rule.
+
 ### Independent networks in Headscale Console
 
 Console deployments can serve independent account networks from one control URL.

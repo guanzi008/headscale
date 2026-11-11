@@ -207,6 +207,7 @@ type Snapshot struct {
 	// calculated from nodesByID
 	nodesByNodeKey    map[key.NodePublic]types.NodeView
 	nodesByMachineKey map[key.MachinePublic]map[types.UserID]types.NodeView
+	nodeIPs           map[netip.Addr]bool
 	// peersByNode stores immutable adjacency as IDs; ListPeers resolves the
 	// corresponding views through nodeViewsByID.
 	peersByNode map[types.NodeID][]types.NodeID
@@ -825,6 +826,7 @@ func snapshotFromNodes(
 		allNodes:          allNodes,
 		nodesByNodeKey:    make(map[key.NodePublic]types.NodeView),
 		nodesByMachineKey: make(map[key.MachinePublic]map[types.UserID]types.NodeView),
+		nodeIPs:           make(map[netip.Addr]bool, 2*len(nodes)),
 		peersByNode:       peerIDsByNode,
 		nodesByUser:       make(map[types.UserID][]types.NodeView),
 		routes:            routes,
@@ -834,6 +836,9 @@ func snapshotFromNodes(
 	for _, n := range nodes {
 		nodeView := nodeViewsByID[n.ID]
 		userID := n.TypedUserID()
+		for _, addr := range nodeView.IPs() {
+			newSnap.nodeIPs[addr.Unmap()] = true
+		}
 
 		// Tagged nodes are owned by their tags, not a user,
 		// so they are not indexed by user.
@@ -970,6 +975,12 @@ func (s *NodeStore) GetNode(id types.NodeID) (types.NodeView, bool) {
 	}
 
 	return n.View(), true
+}
+
+// IsNodeIP reports whether addr is assigned to an existing node, including
+// offline devices and addresses retained after a user's pool changed.
+func (s *NodeStore) IsNodeIP(addr netip.Addr) bool {
+	return s.data.Load().nodeIPs[addr.Unmap()]
 }
 
 // GetNodeByNodeKey retrieves a node by its [key.NodePublic].

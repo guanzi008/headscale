@@ -109,10 +109,7 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 
 	// PrimaryRoutes is what the router serves: the routes it is primary
 	// for, under the rule its peers get them by.
-	tailnode.PrimaryRoutes = slices.DeleteFunc(
-		b.mapper.state.GetNodePrimaryRoutes(nv.ID()),
-		func(p netip.Prefix) bool { return !b.mapper.cfg.ServesRoute(p) },
-	)
+	tailnode.PrimaryRoutes = b.mapper.state.GetNodePrimaryRoutes(nv.ID())
 
 	// As on Tailscale SaaS, only a node's own entry is authorised, and an
 	// expired node's stays so and unmarked; the client reads its expiry from

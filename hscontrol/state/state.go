@@ -41,6 +41,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
@@ -2032,9 +2033,47 @@ func (s *State) UpdatePolicy(pol []byte) (*types.Policy, []change.Change, error)
 	return stored, changes, nil
 }
 
-// GetNodePrimaryRoutes returns the primary routes for a node.
+// GetNodePrimaryRoutes returns the routes a node is primary for and can
+// serve under its owner's effective address pools.
 func (s *State) GetNodePrimaryRoutes(nodeID types.NodeID) []netip.Prefix {
-	return s.nodeStore.PrimaryRoutesForNode(nodeID)
+	node, ok := s.nodeStore.GetNode(nodeID)
+	if !ok {
+		return nil
+	}
+
+	return slices.DeleteFunc(s.nodeStore.PrimaryRoutesForNode(nodeID), func(p netip.Prefix) bool {
+		return !s.servesRoute(node, p)
+	})
+}
+
+// servesRoute distinguishes node host addresses from subnet routes using
+// the advertising user's pools. As in allocation, a custom pool replaces
+// the default prefix for its family; the other family keeps its fallback.
+func (s *State) servesRoute(node types.NodeView, p netip.Prefix) bool {
+	if !p.IsSingleIP() || tsaddr.IsViaPrefix(p) {
+		return true
+	}
+
+	addr := p.Addr().Unmap()
+	if s.nodeStore.IsNodeIP(addr) {
+		return false
+	}
+
+	hasUserPool := false
+	if !node.IsTagged() {
+		for _, pool := range s.polMan.IPPoolForUser(node.TypedUserID()) {
+			if pool.Addr().Is4() != addr.Is4() {
+				continue
+			}
+
+			hasUserPool = true
+			if pool.Contains(addr) {
+				return false
+			}
+		}
+	}
+
+	return hasUserPool || s.cfg.ServesRoute(p)
 }
 
 // RoutesForPeer computes the routes a peer should advertise in a viewer's
@@ -2112,7 +2151,7 @@ func (s *State) RoutesForPeer(
 	// Via inclusions come from the peer's routes, not the election, so
 	// the serving rule is applied here, to everything the viewer gets.
 	return slices.DeleteFunc(reduced, func(p netip.Prefix) bool {
-		return !s.cfg.ServesRoute(p)
+		return !s.servesRoute(peer, p)
 	})
 }
 

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"net/netip"
 	"testing"
 
@@ -13,6 +14,101 @@ import (
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 )
+
+func TestUserIPPoolsControlServedHostRoutes(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	alice := s.CreateUserForTest("alice")
+	bob := s.CreateUserForTest("bob")
+	require.NoError(t, s.UpdatePolicyManagerUsersForTest())
+
+	setPools := func(pools []string) {
+		t.Helper()
+		encoded, err := json.Marshal(pools)
+		require.NoError(t, err)
+		_, _, err = s.UpdatePolicy([]byte(`{
+			"tagOwners":{"tag:router":["alice@"]},
+			"nodeAttrs":[{"target":["alice@"],"ipPool":` + string(encoded) + `},
+			{"target":["bob@"],"ipPool":["10.43.0.0/24","fd43::/64"]}],
+			"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]
+		}`))
+		require.NoError(t, err)
+	}
+	dualPools := []string{"10.42.0.0/24", "fd42:1::/64"}
+	setPools(dualPools)
+	router := registerIPPoolTestNode(t, s, alice, "subnet-router")
+	client := registerIPPoolTestNode(t, s, alice, "android")
+	other := registerIPPoolTestNode(t, s, bob, "other-user")
+
+	outside4 := netip.MustParsePrefix("100.84.4.113/32")
+	mapped4 := netip.MustParsePrefix("::ffff:100.84.4.114/128")
+	outside6 := netip.MustParsePrefix("fd7a:115c:a1e0::123/128")
+	pool4 := netip.MustParsePrefix("10.42.0.123/32")
+	pool6 := netip.MustParsePrefix("fd42:1::123/128")
+	subnet := netip.MustParsePrefix("10.42.0.0/24")
+	via := netip.MustParsePrefix("fd7a:115c:a1e0:b1a:0:7:a09:5/128")
+	routes := []netip.Prefix{outside4, mapped4, outside6, pool4, pool6, subnet, via}
+	// Already assigned addresses must remain protected even after their
+	// owner's pool changes, and even if they belong to another user.
+	for _, node := range []types.NodeView{router, client, other} {
+		for _, addr := range node.IPs() {
+			routes = append(routes, netip.PrefixFrom(addr, addr.BitLen()))
+		}
+	}
+	_, err = s.UpdateNodeFromMapRequest(router.ID(), tailcfg.MapRequest{
+		NodeKey:  router.NodeKey(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "subnet-router", RoutableIPs: routes},
+	})
+	require.NoError(t, err)
+	_, _, err = s.SetApprovedRoutes(router.ID(), routes)
+	require.NoError(t, err)
+	_, epoch := s.Connect(router.ID())
+	require.NotZero(t, epoch)
+
+	check := func(want []netip.Prefix) {
+		t.Helper()
+		freshRouter, ok := s.GetNodeByID(router.ID())
+		require.True(t, ok)
+		freshClient, ok := s.GetNodeByID(client.ID())
+		require.True(t, ok)
+		matchers, err := s.MatchersForNode(freshClient)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, want, s.RoutesForPeer(freshClient, freshRouter, matchers), "routes delivered to the client")
+		assert.ElementsMatch(t, want, s.GetNodePrimaryRoutes(router.ID()), "routes reported as serving by the API")
+		assert.ElementsMatch(t, routes, freshRouter.ApprovedRoutes().AsSlice(), "approval must survive pool changes")
+		assert.Equal(t, router.IPs(), freshRouter.IPs(), "existing device addresses must stay stable")
+	}
+
+	for _, tt := range []struct {
+		name  string
+		pools []string
+		want  []netip.Prefix
+	}{
+		{"both_families", dualPools, []netip.Prefix{outside4, mapped4, outside6, subnet, via}},
+		{"ipv4_only", dualPools[:1], []netip.Prefix{outside4, mapped4, pool6, subnet, via}},
+		{"ipv6_only", dualPools[1:], []netip.Prefix{outside6, pool4, subnet, via}},
+		{"cleared", []string{}, []netip.Prefix{pool4, pool6, subnet, via}},
+		{"restored", dualPools, []netip.Prefix{outside4, mapped4, outside6, subnet, via}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setPools(tt.pools)
+			check(tt.want)
+		})
+	}
+
+	require.NoError(t, s.Close())
+	s, err = NewState(cfg)
+	require.NoError(t, err)
+	s.Connect(router.ID())
+	check([]netip.Prefix{outside4, mapped4, outside6, subnet, via})
+
+	// Tags own a tagged router; its creator's pool must not be used.
+	_, _, err = s.SetNodeTags(router.ID(), []string{"tag:router"})
+	require.NoError(t, err)
+	check([]netip.Prefix{pool4, pool6, subnet, via})
+}
 
 func TestDeleteIPPoolOwnerKeepsPolicyAndRestartWorking(t *testing.T) {
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
